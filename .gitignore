@@ -39,3 +39,15 @@ yarn-error.*
 # generated native folders
 /ios
 /android
+
+#others
+*.apk
+*.aab
+*.zip
+*.keystore
+*.jks
+
+.DS_Store
+Thumbs.db
+.env
+.env.local

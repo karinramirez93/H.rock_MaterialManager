@@ -1,0 +1,1498 @@
+/**
+ * StorageService
+ * --------------
+ * Central data layer for the application. The service keeps the draft list in
+ * local AsyncStorage and keeps the material catalog in Firebase Realtime
+ * Database.
+ *
+ * The service also normalizes old catalog records so older materials continue
+ * working after new features are added, such as descriptions, photos, ids, and
+ * category-based unit defaults.
+ */
+import AsyncStorage from '@react-native-async-storage/async-storage';
+import * as SQLite from 'expo-sqlite';
+import * as FileSystem from 'expo-file-system';
+import { initialCatalog } from './catalogData';
+import { FIREBASE_CONFIG } from './firebaseConfig';
+import { AuthService } from './authService';
+
+const DRAFT_KEY = '@material_draft_v1';
+const GUEST_DRAFT_KEY = '@material_draft_guest_temp_v1';
+
+const createDraftStorageKey = (sessionKey = '') => {
+  const cleanSessionKey = String(sessionKey || '').trim();
+  if (!cleanSessionKey || cleanSessionKey === 'guest') {
+    return GUEST_DRAFT_KEY;
+  }
+
+  return `${DRAFT_KEY}_${cleanSessionKey.replace(/[^a-zA-Z0-9_-]/g, '_')}`;
+};
+const CATALOG_CACHE_KEY = '@material_catalog_cache_v3';
+const SQLITE_DATABASE_NAME = 'material_catalog_local_cache.db';
+const CATALOG_TABLE_NAME = 'catalog_materials';
+const IMPORTANT_INFO_TABLE_NAME = 'important_info_items';
+const LOCAL_IMAGE_CACHE_ROOT = `${FileSystem.documentDirectory || ''}hrocker-image-cache/`;
+const CATALOG_IMAGE_CACHE_DIR = `${LOCAL_IMAGE_CACHE_ROOT}catalog/`;
+const IMPORTANT_INFO_IMAGE_CACHE_DIR = `${LOCAL_IMAGE_CACHE_ROOT}important-info/`;
+
+const SIZE_OPTIONS = ['1/2"', '3/4"', '1"', '1 1/4"', '1 1/2"', '2"', '2 1/4"', '2 1/2"', '3"', '3 1/2"', '4"'];
+
+const extractLegacySizeFromName = (material) => {
+  const originalName = (material.name || '').trim();
+  const existingSize = (material.size || '').trim();
+
+  if (existingSize && existingSize !== 'N/A') {
+    return { name: originalName || 'Unnamed Material', size: existingSize };
+  }
+
+  const matchingSize = [...SIZE_OPTIONS]
+    .sort((a, b) => b.length - a.length)
+    .find((sizeOption) => originalName.endsWith(` ${sizeOption}`) || originalName === sizeOption);
+
+  if (!matchingSize) {
+    return { name: originalName || 'Unnamed Material', size: existingSize || 'N/A' };
+  }
+
+  return {
+    name: originalName.replace(new RegExp(`\\s+${matchingSize.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`), '').trim() || originalName,
+    size: matchingSize
+  };
+};
+
+const getMaterialDisplayName = (material) => {
+  const sizeText = material.size && material.size !== 'N/A' ? ` ${material.size}` : '';
+  return `${material.name || 'Unnamed Material'}${sizeText}`;
+};
+
+
+// Firebase Realtime Database REST endpoint for the shared material catalog.
+// The catalog is stored under /materials so the root database can later keep other app data.
+const FIREBASE_DATABASE_URL = FIREBASE_CONFIG.databaseURL;
+const MATERIALS_ENDPOINT = `${FIREBASE_DATABASE_URL}/materials.json`;
+const CATEGORIES_ENDPOINT = `${FIREBASE_DATABASE_URL}/categories.json`;
+const IMPORTANT_INFO_ENDPOINT = `${FIREBASE_DATABASE_URL}/importantInfo.json`;
+const CATEGORIES_CACHE_KEY = '@material_categories_cache_v1';
+const IMPORTANT_INFO_CACHE_KEY = '@important_info_cache_v1';
+
+const DEFAULT_CATEGORIES = ['Conduits', 'Connectors', 'Conductors', 'Devices', 'Boxes', 'Fittings', 'Tools', 'Others'];
+const DEFAULT_CATEGORY_KEYS = DEFAULT_CATEGORIES.map((category) => category.toLowerCase());
+const createCategoryKey = (category) => String(category || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+const buildAuthenticatedFirebaseUrl = async (baseUrl) => {
+  const idToken = await AuthService.getCurrentIdToken();
+  if (!idToken) throw new Error('OWNER_SESSION_TOKEN_MISSING');
+  return `${baseUrl}?auth=${encodeURIComponent(idToken)}`;
+};
+const normalizeCategoryName = (value) => String(value || '').trim();
+const normalizeCategoryKey = (value) => normalizeCategoryName(value).toLowerCase();
+
+const CONDUCTOR_COLOR_NAMES = ['Black', 'Red', 'Blue', 'Orange', 'Brown', 'Yellow', 'White', 'Green', 'Gray', 'Grey', 'Purple'];
+
+const getConductorColor = (material) => {
+  if (String(material?.category || '').toLowerCase() !== 'conductors') return '';
+  const materialName = String(material?.name || '').trim();
+  const matchingColor = CONDUCTOR_COLOR_NAMES.find((color) => {
+    const colorPattern = new RegExp(`\\b${color}\\b$`, 'i');
+    return colorPattern.test(materialName);
+  });
+  if (!matchingColor) return '';
+  return matchingColor === 'Grey' ? 'Gray' : matchingColor;
+};
+
+const getConductorFamilyBaseName = (material) => {
+  const color = getConductorColor(material);
+  const materialName = String(material?.name || '').trim();
+  if (!color) return getSortableBaseName(material);
+  return materialName.replace(new RegExp(`\\s+${color}$`, 'i'), '').trim();
+};
+
+const getConductorFamilyDisplayName = (material) => {
+  const color = getConductorColor(material);
+  const materialName = String(material?.name || '').trim();
+  if (!color) return materialName || 'Unnamed Material';
+  return materialName.replace(new RegExp(`\\s+${color}$`, 'i'), '').trim() || materialName;
+};
+
+const isConductorColorFamily = (material) => Boolean(getConductorColor(material));
+
+// Fallback audit label used only when no user session is available yet.
+const FALLBACK_USER_LABEL = 'shared-app-user';
+
+const getCurrentAuditUserLabel = async () => {
+  try {
+    return await AuthService.getCurrentUserDisplayName();
+  } catch (error) {
+    console.error('StorageService Warning (audit user):', error);
+    return FALLBACK_USER_LABEL;
+  }
+};
+
+const ensureSharedDataEditor = async () => {
+  await AuthService.ensureCanEditSharedData();
+};
+
+const getDefaultAllowedUnitsByCategory = (category) => {
+  switch ((category || '').toLowerCase()) {
+    case 'conductors':
+      return ['Unit', 'Reel', 'Length (ft)'];
+    case 'conduits':
+      return ['Unit', 'Bundle'];
+    case 'devices':
+      return ['Unit', 'Box'];
+    case 'boxes':
+    case 'connectors':
+    case 'fittings':
+    case 'tools':
+      return ['Unit', 'Box'];
+    case 'others':
+    default:
+      return ['Unit', 'Box', 'Bundle'];
+  }
+};
+
+const normalizeAllowedUnits = (allowedUnits, category) => {
+  if (Array.isArray(allowedUnits) && allowedUnits.length > 0) {
+    const normalizedUnits = allowedUnits.map((unit) => (unit === 'Rolls' ? 'Reel' : unit));
+    const legacyAllUnits = ['Unit', 'Box', 'Bundle', 'Reel', 'Length (ft)'];
+    const looksLikeOldDefault = legacyAllUnits.every((unit) => normalizedUnits.includes(unit));
+
+    // Older records were saved with every unit active. For those records, apply the new category default.
+    // Materials that were manually customized with a smaller set keep their saved selection.
+    if (looksLikeOldDefault && normalizedUnits.length === legacyAllUnits.length) {
+      return getDefaultAllowedUnitsByCategory(category);
+    }
+
+    return normalizedUnits;
+  }
+  return getDefaultAllowedUnitsByCategory(category);
+};
+
+const createMaterialIdentifier = (material) => {
+  const normalizedLegacyFields = extractLegacySizeFromName(material);
+  const baseText = `${normalizedLegacyFields.name || ''}-${material.category || ''}-${normalizedLegacyFields.size || ''}`;
+  return baseText
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '') || `material-${Date.now()}`;
+};
+
+const buildAutomaticKeywords = (material, normalizedLegacyFields) => {
+  const keywordSource = [
+    normalizedLegacyFields.name,
+    material.category,
+    normalizedLegacyFields.size,
+    material.description,
+    ...(Array.isArray(material.keywords) ? material.keywords : [])
+  ];
+
+  const lowerName = (normalizedLegacyFields.name || '').toLowerCase();
+  const automaticAliases = [];
+
+  if (lowerName.includes('conduit')) automaticAliases.push('pipe', 'tube', 'raceway');
+  if (lowerName.includes('pipe')) automaticAliases.push('conduit', 'tube', 'raceway');
+  if (lowerName.includes('coupling')) automaticAliases.push('connector', 'joiner', 'fitting');
+  if (lowerName.includes('connector')) automaticAliases.push('coupling', 'fitting');
+  if (lowerName.includes('sealtite')) automaticAliases.push('seal tight', 'liquid tight', 'flexible conduit');
+  if (lowerName.includes('bushing')) automaticAliases.push('protector', 'conduit end');
+  if (lowerName.includes('uni-strut') || lowerName.includes('unistrut')) automaticAliases.push('strut', 'channel', 'clamp');
+  if (lowerName.includes('wire')) automaticAliases.push('conductor', 'cable');
+
+  // Wire search helper: this lets searches like "THHN # 12", "THHN #12", or "gauge 12" find all matching wire colors.
+  // Add more general automatic keyword rules here when a search term should apply to many existing records.
+  const wireMatch = lowerName.match(/(thhn|xhhw)\s+wire\s+#(\d+)/i);
+  if (wireMatch) {
+    const wireType = wireMatch[1].toLowerCase();
+    const gaugeNumber = wireMatch[2];
+    automaticAliases.push(`${wireType} #${gaugeNumber}`, `${wireType} # ${gaugeNumber}`, `${wireType} ${gaugeNumber}`, `#${gaugeNumber}`, `# ${gaugeNumber}`, `gauge ${gaugeNumber}`);
+
+    if (gaugeNumber === '14' || gaugeNumber === '16') {
+      automaticAliases.push('a/c', 'ac', 'air conditioning', 'thermostat', 'lead lag', 'leadlag', 'control wire');
+    }
+  }
+
+  return [...new Set([...keywordSource, ...automaticAliases]
+    .filter(Boolean)
+    .flatMap((value) => String(value).split(','))
+    .map((value) => value.trim().toLowerCase())
+    .filter(Boolean))];
+};
+
+
+const isInlineImageDataUri = (value) => typeof value === 'string' && value.startsWith('data:image') && value.includes('base64,');
+
+const sanitizeImageFileName = (value) => String(value || 'image')
+  .toLowerCase()
+  .replace(/[^a-z0-9]+/g, '-')
+  .replace(/^-+|-+$/g, '') || `image-${Date.now()}`;
+
+const getImageExtensionFromDataUri = (dataUri) => {
+  const mimeMatch = String(dataUri || '').match(/^data:image\/(png|jpeg|jpg|webp);base64,/i);
+  if (!mimeMatch) return 'jpg';
+  return mimeMatch[1].toLowerCase() === 'jpeg' ? 'jpg' : mimeMatch[1].toLowerCase();
+};
+
+const ensureDirectoryExists = async (directoryUri) => {
+  if (!FileSystem.documentDirectory) return false;
+  const info = await FileSystem.getInfoAsync(directoryUri);
+  if (!info.exists) {
+    await FileSystem.makeDirectoryAsync(directoryUri, { intermediates: true });
+  }
+  return true;
+};
+
+/**
+ * Saves a base64 data URI as a local image file and returns the file:// path.
+ *
+ * Firebase can still keep a compressed image payload for syncing between
+ * devices, but SQLite should only cache lightweight references. This helper is
+ * the bridge: when Firebase sends an inline image, the app writes it to the
+ * device file system and stores only the resulting file path in SQLite.
+ */
+const saveInlineImageToLocalFile = async ({ dataUri, fileKey, directoryUri }) => {
+  if (!isInlineImageDataUri(dataUri)) return dataUri || '';
+  if (!FileSystem.documentDirectory) return dataUri;
+
+  try {
+    await ensureDirectoryExists(LOCAL_IMAGE_CACHE_ROOT);
+    await ensureDirectoryExists(directoryUri);
+
+    const extension = getImageExtensionFromDataUri(dataUri);
+    const base64Data = String(dataUri).split('base64,')[1] || '';
+    const safeFileName = `${sanitizeImageFileName(fileKey)}.${extension}`;
+    const fileUri = `${directoryUri}${safeFileName}`;
+
+    await FileSystem.writeAsStringAsync(fileUri, base64Data, {
+      encoding: FileSystem.EncodingType.Base64
+    });
+
+    return fileUri;
+  } catch (error) {
+    console.warn('Image cache warning: could not write image to local file system.', error);
+    return '';
+  }
+};
+
+const prepareMaterialForLocalCache = async (material) => {
+  const normalized = normalizeMaterial(material);
+
+  if (!isInlineImageDataUri(normalized.imageUri)) {
+    return normalized;
+  }
+
+  const localImageUri = await saveInlineImageToLocalFile({
+    dataUri: normalized.imageUri,
+    fileKey: `${normalized.id}-${normalized.updatedAt || 'image'}`,
+    directoryUri: CATALOG_IMAGE_CACHE_DIR
+  });
+
+  return {
+    ...normalized,
+    imageUri: localImageUri
+  };
+};
+
+const prepareImportantInfoForLocalCache = async (item) => {
+  const normalized = normalizeImportantInfoItem(item);
+
+  if (!isInlineImageDataUri(normalized.imageUri)) {
+    return normalized;
+  }
+
+  const localImageUri = await saveInlineImageToLocalFile({
+    dataUri: normalized.imageUri,
+    fileKey: `${normalized.id}-${normalized.updatedAt || 'image'}`,
+    directoryUri: IMPORTANT_INFO_IMAGE_CACHE_DIR
+  });
+
+  return {
+    ...normalized,
+    imageUri: localImageUri
+  };
+};
+
+const normalizeMaterial = (material) => {
+  const normalizedLegacyFields = extractLegacySizeFromName(material);
+
+  let familyName = (material.familyName || material.groupName || '').trim();
+
+  // If familyName is missing or just matches the full name, we try to detect
+  // a wire family automatically based on the conductor color rules.
+  if (!familyName || familyName.toLowerCase() === (normalizedLegacyFields.name || '').toLowerCase()) {
+    if (isConductorColorFamily(material)) {
+      familyName = getConductorFamilyDisplayName(material);
+    } else {
+      familyName = familyName || normalizedLegacyFields.name || 'Unnamed Material';
+    }
+  }
+
+  return {
+    id: material.id || createMaterialIdentifier(material),
+    name: normalizedLegacyFields.name || 'Unnamed Material',
+    familyName: familyName,
+    category: material.category === 'Other' ? 'Others' : (material.category || 'Others'),
+    size: normalizedLegacyFields.size || 'N/A',
+    imageUri: material.imageUri || '',
+    description: material.description || '',
+    forceShowDescription: material.forceShowDescription === true,
+    keywords: buildAutomaticKeywords(material, normalizedLegacyFields),
+    allowedUnits: normalizeAllowedUnits(material.allowedUnits, material.category),
+    createdAt: material.createdAt || new Date().toISOString(),
+    updatedAt: material.updatedAt || new Date().toISOString(),
+    requestCount: Number(material.requestCount || 0),
+    lastRequestedAt: material.lastRequestedAt || '',
+    deleted: material.deleted === true,
+    deletedAt: material.deletedAt || '',
+    createdBy: material.createdBy || FALLBACK_USER_LABEL,
+    updatedBy: material.updatedBy || FALLBACK_USER_LABEL,
+    deletedBy: material.deletedBy || ''
+  };
+};
+
+// Converts a trade-size string into a numeric inch value so sizes always sort
+// by real measurement instead of alphabetical text order.
+// Supported examples:
+// - 1/2"    -> 0.5
+// - 3/4"    -> 0.75
+// - 1"      -> 1
+// - 1 1/8"  -> 1.125
+// - 1 1/4"  -> 1.25
+// - 2"      -> 2
+// The parser is not limited to the size buttons. If a future Firebase record
+// uses a valid size like 5", 6", or 1 1/8", it will still be sorted correctly.
+const convertSizeToNumber = (size) => {
+  if (!size || size === 'N/A') return Number.MAX_SAFE_INTEGER;
+
+  const cleanSize = String(size)
+    .replace(/inches|inch|in\.?/gi, '')
+    .replace(/”|“/g, '"')
+    .replace(/"/g, '')
+    .trim()
+    .replace(/\s+/g, ' ');
+
+  // Matches whole numbers with optional fractions, such as 1, 1 1/8, or 2 3/4.
+  const mixedNumberMatch = cleanSize.match(/^(\d+)(?:\s+(\d+)\/(\d+))?$/);
+  if (mixedNumberMatch) {
+    const wholeNumber = Number(mixedNumberMatch[1]);
+    const numerator = mixedNumberMatch[2] ? Number(mixedNumberMatch[2]) : 0;
+    const denominator = mixedNumberMatch[3] ? Number(mixedNumberMatch[3]) : 1;
+    return wholeNumber + (denominator ? numerator / denominator : 0);
+  }
+
+  // Matches pure fractions, such as 1/2 or 3/4.
+  const fractionMatch = cleanSize.match(/^(\d+)\/(\d+)$/);
+  if (fractionMatch) {
+    const numerator = Number(fractionMatch[1]);
+    const denominator = Number(fractionMatch[2]);
+    return denominator ? numerator / denominator : Number.MAX_SAFE_INTEGER;
+  }
+
+  const decimalValue = Number(cleanSize);
+  return Number.isFinite(decimalValue) ? decimalValue : Number.MAX_SAFE_INTEGER;
+};
+
+// Reads size from the official size field first, then falls back to a trailing
+// size in the material name. This protects older Firebase records that may
+// still have the size typed into the name instead of stored in `size`.
+const getSortableSizeValue = (material) => {
+  if (material?.size && material.size !== 'N/A') return convertSizeToNumber(material.size);
+
+  const displayName = getMaterialDisplayName(material);
+  const sizeMatch = displayName.match(/(?:^|\s)((?:\d+\s+)?\d+\/\d+|\d+(?:\.\d+)?)"?\s*$/);
+  return sizeMatch ? convertSizeToNumber(sizeMatch[1]) : Number.MAX_SAFE_INTEGER;
+};
+
+// Removes a trailing trade size from older material names before sorting.
+// Example: "EMT Coupling 1/2" becomes "EMT Coupling" for alphabetic grouping.
+const getSortableBaseName = (material) => {
+  return (material?.name || getMaterialDisplayName(material) || 'Unnamed Material')
+    .replace(/\s+((?:\d+\s+)?\d+\/\d+|\d+(?:\.\d+)?)"?\s*$/, '')
+    .trim()
+    .toLowerCase();
+};
+
+// Keeps the saved and cached catalog alphabetized by material family, then sorts
+// every same-name family by real inch size in ascending order.
+// Result example for EMT Conduit: 1/2", 3/4", 1", 1 1/8", 1 1/4", 1 1/2", 2"...
+const sortCatalog = (catalog) => {
+  return [...catalog].sort((a, b) => {
+    const baseNameComparison = getSortableBaseName(a).localeCompare(getSortableBaseName(b));
+    if (baseNameComparison !== 0) return baseNameComparison;
+
+    const sizeComparison = getSortableSizeValue(a) - getSortableSizeValue(b);
+    if (sizeComparison !== 0) return sizeComparison;
+
+    return getMaterialDisplayName(a).localeCompare(getMaterialDisplayName(b));
+  });
+};
+
+
+const normalizeImportantInfoItem = (item) => ({
+  id: item.id || `info-${Date.now()}`,
+  title: item.title || 'Untitled Info',
+  body: item.body || '',
+  imageUri: item.imageUri || '',
+  createdAt: item.createdAt || new Date().toISOString(),
+  updatedAt: item.updatedAt || new Date().toISOString(),
+  deleted: item.deleted === true,
+  deletedAt: item.deletedAt || '',
+  createdBy: item.createdBy || FALLBACK_USER_LABEL,
+  updatedBy: item.updatedBy || FALLBACK_USER_LABEL,
+  deletedBy: item.deletedBy || ''
+});
+
+const sortImportantInfo = (items) => [...items].sort((a, b) => a.title.localeCompare(b.title));
+
+const convertFirebaseObjectToArray = (firebaseData) => {
+  if (!firebaseData) return [];
+
+  return Object.keys(firebaseData).map((key) => ({
+    ...firebaseData[key],
+    // The Firebase node key must be the internal id used by the app.
+    // Some old records may contain a duplicated `id` field inside the object.
+    // Placing `id: key` last prevents duplicate React keys and keeps the id hidden in the backend only.
+    id: key
+  }));
+};
+
+let sqliteDatabasePromise = null;
+let sqliteDatabaseSetupPromise = null;
+let sqliteWriteQueue = Promise.resolve();
+
+/**
+ * Runs SQLite write operations one after another.
+ *
+ * Expo SQLite can reject writes when two async calls try to open transactions at
+ * the same time. The catalog can refresh from Firebase while the user is also
+ * adding a material to the draft list, so this small queue prevents overlapping
+ * cache writes without changing the rest of the app.
+ */
+const runSQLiteWriteSafely = async (operation) => {
+  const queuedOperation = sqliteWriteQueue.then(operation, operation);
+
+  sqliteWriteQueue = queuedOperation.catch(() => {
+    // The queue should continue even if one cache write fails. Firebase and the
+    // local draft are still the important data sources, so SQLite errors should
+    // not block the app.
+  });
+
+  return queuedOperation;
+};
+
+/**
+ * Opens the local SQLite database once and reuses the same connection.
+ * SQLite is used only as a fast local cache. Firebase remains the shared source
+ * of truth, but the app can show cached catalog data immediately while Firebase
+ * refreshes in the background.
+ */
+const getSQLiteDatabase = async () => {
+  if (!sqliteDatabasePromise) {
+    sqliteDatabasePromise = SQLite.openDatabaseAsync(SQLITE_DATABASE_NAME);
+  }
+
+  const database = await sqliteDatabasePromise;
+
+  if (!sqliteDatabaseSetupPromise) {
+    sqliteDatabaseSetupPromise = database.execAsync(`
+      PRAGMA journal_mode = WAL;
+      CREATE TABLE IF NOT EXISTS ${CATALOG_TABLE_NAME} (
+        id TEXT PRIMARY KEY NOT NULL,
+        data TEXT NOT NULL,
+        updatedAt TEXT,
+        deleted INTEGER DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS ${IMPORTANT_INFO_TABLE_NAME} (
+        id TEXT PRIMARY KEY NOT NULL,
+        data TEXT NOT NULL,
+        updatedAt TEXT,
+        deleted INTEGER DEFAULT 0
+      );
+    `);
+  }
+
+  await sqliteDatabaseSetupPromise;
+  return database;
+};
+
+// Catalog photos can be very large base64 data URIs. SQLite should not store
+// those images directly. The local cache keeps only one image reference per
+// material family and writes inline Firebase images to the device file system.
+// Every repeated size still appears in the catalog, but only one family image
+// is cached locally. This keeps the app fast and prevents SQLITE_FULL.
+const getMaterialFamilyKeyForCache = (material) => `${String(material?.category || 'Others').toLowerCase()}::${getSortableBaseName(material)}`;
+
+const createFamilySharedImageCatalogCache = async (catalog) => {
+  const familyImageAlreadyCached = new Set();
+  const preparedCatalog = [];
+
+  for (const material of catalog || []) {
+    const normalized = normalizeMaterial(material);
+    const familyKey = getMaterialFamilyKeyForCache(normalized);
+    const hasImage = Boolean(normalized.imageUri);
+
+    if (hasImage && familyImageAlreadyCached.has(familyKey)) {
+      preparedCatalog.push({ ...normalized, imageUri: '' });
+      continue;
+    }
+
+    const preparedMaterial = await prepareMaterialForLocalCache(normalized);
+    if (hasImage) familyImageAlreadyCached.add(familyKey);
+    preparedCatalog.push(preparedMaterial);
+  }
+
+  return preparedCatalog;
+};
+
+/**
+ * Writes catalog rows into SQLite. Existing rows are replaced by id, which makes
+ * the cache safe for repeated Firebase syncs and local edits.
+ */
+const saveCatalogToSQLite = async (catalog) => {
+  const familySharedCatalog = await createFamilySharedImageCatalogCache(catalog);
+
+  await runSQLiteWriteSafely(async () => {
+    const database = await getSQLiteDatabase();
+
+    // This cache must mirror Firebase exactly after every cloud refresh.
+    // Older versions only inserted/replaced rows, so hard-deleted Firebase
+    // materials stayed visible on the device forever. Clearing first makes
+    // pull-to-refresh and background sync remove deleted cloud records too.
+    await database.runAsync(`DELETE FROM ${CATALOG_TABLE_NAME};`);
+
+    // Avoid withTransactionAsync here. On some Expo SQLite versions, a background
+    // Firebase sync and a foreground user action can overlap and produce:
+    // "cannot start a transaction within a transaction". Sequential runAsync
+    // calls are slower than one transaction, but they are much safer for this
+    // cache layer and they do not block the requisition workflow.
+    for (const material of familySharedCatalog || []) {
+      const normalized = normalizeMaterial(material);
+      await database.runAsync(
+        `INSERT OR REPLACE INTO ${CATALOG_TABLE_NAME} (id, data, updatedAt, deleted) VALUES (?, ?, ?, ?);`,
+        [normalized.id, JSON.stringify(normalized), normalized.updatedAt || '', normalized.deleted ? 1 : 0]
+      );
+    }
+  });
+};
+
+/**
+ * Reads catalog rows from SQLite and hides soft-deleted records from normal UI.
+ */
+const loadCatalogFromSQLite = async () => {
+  const database = await getSQLiteDatabase();
+  const rows = await database.getAllAsync(`SELECT data FROM ${CATALOG_TABLE_NAME} WHERE deleted = 0;`);
+  return sortCatalog(rows.map((row) => normalizeMaterial(JSON.parse(row.data))).filter((material) => material.deleted !== true));
+};
+
+/**
+ * Removes one catalog row from the visible SQLite cache without touching
+ * Firebase. Firebase still keeps soft-deleted records for recovery.
+ */
+const removeCatalogRowFromSQLite = async (materialId) => {
+  await runSQLiteWriteSafely(async () => {
+    const database = await getSQLiteDatabase();
+    await database.runAsync(`DELETE FROM ${CATALOG_TABLE_NAME} WHERE id = ?;`, [materialId]);
+  });
+};
+
+const saveImportantInfoToSQLite = async (items) => {
+  await runSQLiteWriteSafely(async () => {
+    const database = await getSQLiteDatabase();
+
+    // Same reason as the catalog cache: Important Info can refresh while the
+    // user is editing a card, so writes are queued and executed without nested
+    // transactions.
+    for (const item of items || []) {
+      const normalized = normalizeImportantInfoItem(item);
+      await database.runAsync(
+        `INSERT OR REPLACE INTO ${IMPORTANT_INFO_TABLE_NAME} (id, data, updatedAt, deleted) VALUES (?, ?, ?, ?);`,
+        [normalized.id, JSON.stringify(normalized), normalized.updatedAt || '', normalized.deleted ? 1 : 0]
+      );
+    }
+  });
+};
+
+const loadImportantInfoFromSQLite = async () => {
+  const database = await getSQLiteDatabase();
+  const rows = await database.getAllAsync(`SELECT data FROM ${IMPORTANT_INFO_TABLE_NAME} WHERE deleted = 0;`);
+  return sortImportantInfo(rows.map((row) => normalizeImportantInfoItem(JSON.parse(row.data))).filter((item) => item.deleted !== true));
+};
+
+const removeImportantInfoRowFromSQLite = async (itemId) => {
+  await runSQLiteWriteSafely(async () => {
+    const database = await getSQLiteDatabase();
+    await database.runAsync(`DELETE FROM ${IMPORTANT_INFO_TABLE_NAME} WHERE id = ?;`, [itemId]);
+  });
+};
+
+export const StorageService = {
+  /**
+   * Saves project draft locally. The requisition stays local and independent from catalog images.
+   */
+  async saveDraft(projectData) {
+    try {
+      if (!projectData) return;
+      const jsonValue = JSON.stringify(projectData);
+      const draftKey = createDraftStorageKey(projectData.creatorSessionKey);
+      await AsyncStorage.setItem(draftKey, jsonValue);
+    } catch (e) {
+      console.error('StorageService Error (saveDraft):', e);
+    }
+  },
+
+  /**
+   * Loads project draft from local storage.
+   */
+  async loadDraft(sessionKey = '') {
+    const draftKey = createDraftStorageKey(sessionKey);
+
+    try {
+      const jsonValue = await AsyncStorage.getItem(draftKey);
+      if (jsonValue !== null) {
+        return JSON.parse(jsonValue);
+      }
+
+      // Remove the old shared draft key if it exists. Older versions used one
+      // shared local draft for every account, which could make a new user see a
+      // previous user's requisition. From now on every registered user has a
+      // separate draft key based on their own uid/email, and guests use a
+      // temporary guest key.
+      await AsyncStorage.removeItem(DRAFT_KEY);
+
+      return null;
+    } catch (e) {
+      console.error('StorageService Error (loadDraft):', e);
+      await AsyncStorage.removeItem(draftKey);
+      return null;
+    }
+  },
+
+  async clearDraft(sessionKey = '') {
+    try {
+      await AsyncStorage.removeItem(createDraftStorageKey(sessionKey));
+    } catch (e) {
+      console.error('StorageService Error (clearDraft):', e);
+    }
+  },
+
+  async clearGuestDraft() {
+    try {
+      await AsyncStorage.removeItem(GUEST_DRAFT_KEY);
+    } catch (e) {
+      console.error('StorageService Error (clearGuestDraft):', e);
+    }
+  },
+
+  /**
+   * Saves a local catalog cache. This is only a backup if Firebase is temporarily unavailable.
+   */
+  async saveCatalogCache(catalog) {
+    try {
+      const sortedCatalog = sortCatalog((catalog || []).map(normalizeMaterial));
+      const familySharedCatalog = await createFamilySharedImageCatalogCache(sortedCatalog);
+      await saveCatalogToSQLite(familySharedCatalog);
+
+      // AsyncStorage receives only local file references, never large base64
+      // images. This fallback stays lightweight even as the catalog grows.
+      await AsyncStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify(familySharedCatalog));
+    } catch (e) {
+      console.warn('StorageService Warning (saveCatalogCache skipped):', e);
+    }
+  },
+
+  /**
+   * Loads the local catalog cache.
+   */
+  async loadCatalogCache() {
+    try {
+      const sqliteCatalog = await loadCatalogFromSQLite();
+      if (sqliteCatalog.length > 0) return sqliteCatalog;
+    } catch (sqliteError) {
+      console.error('StorageService Error (loadCatalogCache SQLite):', sqliteError);
+    }
+
+    try {
+      const jsonValue = await AsyncStorage.getItem(CATALOG_CACHE_KEY);
+      if (!jsonValue) return [];
+      const parsed = JSON.parse(jsonValue);
+      return Array.isArray(parsed) ? sortCatalog(parsed.map(normalizeMaterial).filter((material) => material.deleted !== true)) : [];
+    } catch (e) {
+      console.error('StorageService Error (loadCatalogCache AsyncStorage fallback):', e);
+      return [];
+    }
+  },
+
+  /**
+   * Pulls the newest catalog from Firebase and updates SQLite. This method is
+   * intentionally separated from loadCatalog so the UI can open quickly from
+   * local data while a cloud refresh runs in the background.
+   */
+  async syncCatalogFromFirebase() {
+    const response = await fetch(MATERIALS_ENDPOINT);
+
+    if (!response.ok) {
+      throw new Error(`Firebase load failed: ${response.status}`);
+    }
+
+    const firebaseData = await response.json();
+    let catalog = convertFirebaseObjectToArray(firebaseData).map(normalizeMaterial).filter((material) => material.deleted !== true);
+
+    if (catalog.length === 0) {
+      catalog = await this.seedInitialCatalog();
+    }
+
+    catalog = sortCatalog(catalog);
+    await this.saveCatalogCache(catalog);
+    return catalog;
+  },
+
+  /**
+   * Reads the material catalog from local SQLite first so the catalog opens
+   * quickly and does not contact Firebase on every screen focus. If local data
+   * exists, Firebase refreshes in the background. If local data is empty, the
+   * method waits for Firebase once and seeds the starter catalog if needed.
+   */
+  async loadCatalog() {
+    const cachedCatalog = await this.loadCatalogCache();
+
+    if (cachedCatalog.length > 0) {
+      // Do not block the UI. The screen receives cached data immediately while
+      // Firebase updates SQLite in the background for the next refresh.
+      this.syncCatalogFromFirebase().catch((error) => {
+        console.error('StorageService Background Catalog Sync Error:', error);
+      });
+      return cachedCatalog;
+    }
+
+    try {
+      return await this.syncCatalogFromFirebase();
+    } catch (e) {
+      console.error('StorageService Error (loadCatalog Firebase):', e);
+      const starterCatalog = sortCatalog(initialCatalog.map(normalizeMaterial));
+      await this.saveCatalogCache(starterCatalog);
+      return starterCatalog;
+    }
+  },
+
+  /**
+   * Adds one material to Firebase without replacing the full catalog.
+   */
+  async addMaterial(material) {
+    try {
+      await ensureSharedDataEditor();
+      const now = new Date().toISOString();
+      const userLabel = await getCurrentAuditUserLabel();
+      const preparedMaterial = normalizeMaterial({
+        ...material,
+        createdAt: material.createdAt || now,
+        updatedAt: now,
+        createdBy: material.createdBy || userLabel,
+        updatedBy: userLabel,
+        deleted: false,
+        deletedAt: '',
+        deletedBy: ''
+      });
+
+      // Use the current local cache for duplicate checks so this write does not
+      // trigger a background Firebase sync that can overwrite the newly added
+      // material before the UI refreshes. If the cache is empty, sync once.
+      let existingCatalog = await this.loadCatalogCache();
+      if (existingCatalog.length === 0) {
+        try {
+          existingCatalog = await this.syncCatalogFromFirebase();
+        } catch (syncError) {
+          console.warn('StorageService Warning (addMaterial duplicate sync skipped):', syncError);
+          existingCatalog = [];
+        }
+      }
+
+      const exists = existingCatalog.some(
+        (item) => item.name.toLowerCase() === preparedMaterial.name.toLowerCase() && (item.size || 'N/A').toLowerCase() === (preparedMaterial.size || 'N/A').toLowerCase()
+      );
+
+      if (exists) {
+        throw new Error('DUPLICATE_MATERIAL');
+      }
+
+      const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${preparedMaterial.id}.json`);
+      const response = await fetch(materialUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(preparedMaterial)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Firebase save failed: ${response.status}`);
+      }
+
+      const updatedCatalog = sortCatalog([...existingCatalog, preparedMaterial]);
+      await this.saveCatalogCache(updatedCatalog);
+      return preparedMaterial;
+    } catch (e) {
+      console.error('StorageService Error (addMaterial):', e);
+      throw e;
+    }
+  },
+
+
+  /**
+   * Updates a whole material family in one Firebase multi-location PATCH.
+   * A family is a repeated material with the same base name but different sizes,
+   * such as EMT Pipe 1/2", 3/4", 1", etc. The UI sends all family variants here
+   * so one shared image, name, category, description, and unit set can be applied
+   * consistently without editing every size one by one.
+   */
+  async updateMaterialFamily(materialVariants) {
+    try {
+      await ensureSharedDataEditor();
+      if (!Array.isArray(materialVariants) || materialVariants.length === 0) {
+        throw new Error('MISSING_MATERIAL_FAMILY');
+      }
+
+      const existingCatalog = await this.loadCatalog();
+      const userLabel = await getCurrentAuditUserLabel();
+      const now = new Date().toISOString();
+
+      const normalizedUpdates = materialVariants.map((variant) => normalizeMaterial({
+        ...variant,
+        id: variant.id,
+        name: (variant.name || '').trim(),
+        category: variant.category || 'Others',
+        size: variant.size || 'N/A',
+        imageUri: variant.imageUri || '',
+        description: variant.description || '',
+        allowedUnits: normalizeAllowedUnits(variant.allowedUnits, variant.category),
+        createdAt: variant.createdAt || now,
+        createdBy: variant.createdBy || userLabel,
+        updatedAt: now,
+        updatedBy: userLabel,
+        deleted: variant.deleted === true,
+        deletedAt: variant.deletedAt || '',
+        deletedBy: variant.deletedBy || ''
+      }));
+
+      const idsBeingUpdated = new Set(normalizedUpdates.map((item) => item.id));
+      const duplicate = existingCatalog.some((existingItem) => {
+        if (idsBeingUpdated.has(existingItem.id)) return false;
+        return normalizedUpdates.some((updatedItem) =>
+          existingItem.name.toLowerCase() === updatedItem.name.toLowerCase() &&
+          (existingItem.size || 'N/A').toLowerCase() === (updatedItem.size || 'N/A').toLowerCase()
+        );
+      });
+
+      if (duplicate) {
+        throw new Error('DUPLICATE_MATERIAL');
+      }
+
+      const firebasePatch = {};
+      normalizedUpdates.forEach((material) => {
+        firebasePatch[material.id] = material;
+      });
+
+      const materialsUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials.json`);
+      const response = await fetch(materialsUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(firebasePatch)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Firebase material family update failed: ${response.status}`);
+      }
+
+      const updateMap = new Map(normalizedUpdates.map((item) => [item.id, item]));
+      const updatedCatalog = sortCatalog(existingCatalog.map((item) => updateMap.get(item.id) || item));
+      await this.saveCatalogCache(updatedCatalog);
+      return normalizedUpdates;
+    } catch (e) {
+      console.error('StorageService Error (updateMaterialFamily):', e);
+      throw e;
+    }
+  },
+
+
+  /**
+   * Updates editable catalog details for an existing material in Firebase.
+   * This edits the catalog record only. Existing requisition rows are not changed automatically.
+   */
+  async updateMaterial(materialId, materialChanges) {
+    try {
+      await ensureSharedDataEditor();
+      if (!materialId) {
+        throw new Error('MISSING_MATERIAL_ID');
+      }
+
+      const cleanName = materialChanges.name?.trim();
+      if (!cleanName) {
+        throw new Error('MISSING_MATERIAL_NAME');
+      }
+
+      const existingCatalog = await this.loadCatalog();
+      const duplicate = existingCatalog.some((item) =>
+        item.id !== materialId && item.name.toLowerCase() === cleanName.toLowerCase() && (item.size || 'N/A').toLowerCase() === (materialChanges.size || 'N/A').toLowerCase()
+      );
+
+      if (duplicate) {
+        throw new Error('DUPLICATE_MATERIAL');
+      }
+
+      const userLabel = await getCurrentAuditUserLabel();
+      const updatedMaterial = normalizeMaterial({
+        ...materialChanges,
+        id: materialId,
+        name: cleanName,
+        category: materialChanges.category || 'Others',
+        size: materialChanges.size || 'N/A',
+        imageUri: materialChanges.imageUri || '',
+        description: materialChanges.description || '',
+        allowedUnits: normalizeAllowedUnits(materialChanges.allowedUnits, materialChanges.category),
+        createdAt: materialChanges.createdAt || new Date().toISOString(),
+        createdBy: materialChanges.createdBy || userLabel,
+        updatedAt: new Date().toISOString(),
+        updatedBy: userLabel,
+        deleted: materialChanges.deleted === true,
+        deletedAt: materialChanges.deletedAt || '',
+        deletedBy: materialChanges.deletedBy || ''
+      });
+
+      const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
+      const response = await fetch(materialUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(updatedMaterial)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Firebase material update failed: ${response.status}`);
+      }
+
+      const updatedCatalog = sortCatalog(
+        existingCatalog.map((item) => (item.id === materialId ? updatedMaterial : item))
+      );
+
+      await this.saveCatalogCache(updatedCatalog);
+      return updatedMaterial;
+    } catch (e) {
+      console.error('StorageService Error (updateMaterial):', e);
+      throw e;
+    }
+  },
+
+
+  /**
+   * Updates only the catalog image for an existing material in Firebase.
+   * This keeps the requisition/draft list independent from catalog photos.
+   */
+  async updateMaterialImage(materialId, imageUri) {
+    try {
+      await ensureSharedDataEditor();
+      if (!materialId) {
+        throw new Error('MISSING_MATERIAL_ID');
+      }
+
+      const userLabel = await getCurrentAuditUserLabel();
+      const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
+      const response = await fetch(materialUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          imageUri: imageUri || '',
+          updatedAt: new Date().toISOString(),
+          updatedBy: userLabel
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error(`Firebase image update failed: ${response.status}`);
+      }
+
+      const existingCatalog = await this.loadCatalogCache();
+      const updatedCatalog = existingCatalog.map((item) => (
+        item.id === materialId
+          ? { ...item, imageUri: imageUri || '', updatedAt: new Date().toISOString(), updatedBy: userLabel }
+          : item
+      ));
+      await this.saveCatalogCache(updatedCatalog);
+      return true;
+    } catch (e) {
+      console.error('StorageService Error (updateMaterialImage):', e);
+      throw e;
+    }
+  },
+
+  /**
+   * Seeds Firebase with the starter catalog only when the cloud catalog is empty.
+   */
+  async seedInitialCatalog() {
+    const preparedCatalog = initialCatalog.map(normalizeMaterial);
+    const firebaseObject = preparedCatalog.reduce((accumulator, material) => {
+      accumulator[material.id] = material;
+      return accumulator;
+    }, {});
+
+    const materialsUrl = await buildAuthenticatedFirebaseUrl(MATERIALS_ENDPOINT);
+    const response = await fetch(materialsUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(firebaseObject)
+    });
+
+    if (!response.ok) {
+      throw new Error(`Firebase seed failed: ${response.status}`);
+    }
+
+    await this.saveCatalogCache(preparedCatalog);
+    return preparedCatalog;
+  },
+
+  /**
+   * Backward-compatible method name. It now merges catalog records instead of overwriting the full Firebase catalog. This prevents accidental deletion of existing Firebase materials.
+   */
+  async saveCatalog(catalog) {
+    try {
+      const preparedCatalog = catalog.map(normalizeMaterial);
+      const firebaseObject = preparedCatalog.reduce((accumulator, material) => {
+        accumulator[material.id] = material;
+        return accumulator;
+      }, {});
+
+      const materialsUrl = await buildAuthenticatedFirebaseUrl(MATERIALS_ENDPOINT);
+      const response = await fetch(materialsUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(firebaseObject)
+      });
+
+      if (!response.ok) {
+        throw new Error(`Firebase saveCatalog failed: ${response.status}`);
+      }
+
+      const existingCatalog = await this.loadCatalogCache();
+      const mergedById = [...existingCatalog, ...preparedCatalog].reduce((accumulator, material) => {
+        accumulator[material.id] = material;
+        return accumulator;
+      }, {});
+      await this.saveCatalogCache(sortCatalog(Object.values(mergedById)));
+    } catch (e) {
+      console.error('StorageService Error (saveCatalog):', e);
+      throw e;
+    }
+  },
+
+
+  /**
+   * Increments the request counter for catalog materials after they are added
+   * to the requisition. The counter is used by the catalog sort menu so the
+   * most frequently requested materials can appear first when that option is selected.
+   */
+  async incrementMaterialRequestCount(materialIds = []) {
+    try {
+      const uniqueIds = [...new Set((materialIds || []).filter(Boolean))];
+      if (uniqueIds.length === 0) return true;
+
+      const catalog = await this.loadCatalog();
+      const now = new Date().toISOString();
+      const userLabel = await getCurrentAuditUserLabel();
+
+      await Promise.all(uniqueIds.map(async (materialId) => {
+        const material = catalog.find((item) => item.id === materialId);
+        if (!material) return;
+
+        const newRequestCount = Number(material.requestCount || 0) + 1;
+        const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
+        const response = await fetch(materialUrl, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ requestCount: newRequestCount, lastRequestedAt: now, updatedAt: now, updatedBy: userLabel })
+        });
+
+        if (!response.ok) {
+          throw new Error(`Firebase usage update failed: ${response.status}`);
+        }
+      }));
+
+      const updatedCatalog = catalog.map((item) => uniqueIds.includes(item.id)
+        ? { ...item, requestCount: Number(item.requestCount || 0) + 1, lastRequestedAt: now, updatedAt: now, updatedBy: userLabel }
+        : item
+      );
+      await this.saveCatalogCache(updatedCatalog);
+      return true;
+    } catch (e) {
+      console.error('StorageService Error (incrementMaterialRequestCount):', e);
+      return false;
+    }
+  },
+
+  /**
+   * Saves the local Important Info cache so the screen still has data when
+   * Firebase is temporarily unavailable.
+   */
+  async saveImportantInfoCache(items) {
+    try {
+      const sortedItems = sortImportantInfo((items || []).map(normalizeImportantInfoItem));
+      const localCacheItems = [];
+      for (const item of sortedItems) {
+        localCacheItems.push(await prepareImportantInfoForLocalCache(item));
+      }
+      await saveImportantInfoToSQLite(localCacheItems);
+      await AsyncStorage.setItem(IMPORTANT_INFO_CACHE_KEY, JSON.stringify(localCacheItems));
+    } catch (e) {
+      console.error('StorageService Error (saveImportantInfoCache SQLite):', e);
+      try {
+        await AsyncStorage.setItem(IMPORTANT_INFO_CACHE_KEY, JSON.stringify(items || []));
+      } catch (storageError) {
+        console.error('StorageService Error (saveImportantInfoCache AsyncStorage fallback):', storageError);
+      }
+    }
+  },
+
+  /**
+   * Loads the local Important Info cache.
+   */
+  async loadImportantInfoCache() {
+    try {
+      const sqliteItems = await loadImportantInfoFromSQLite();
+      if (sqliteItems.length > 0) return sqliteItems;
+    } catch (sqliteError) {
+      console.error('StorageService Error (loadImportantInfoCache SQLite):', sqliteError);
+    }
+
+    try {
+      const jsonValue = await AsyncStorage.getItem(IMPORTANT_INFO_CACHE_KEY);
+      if (!jsonValue) return [];
+      const parsed = JSON.parse(jsonValue);
+      return Array.isArray(parsed) ? sortImportantInfo(parsed.map(normalizeImportantInfoItem).filter((item) => item.deleted !== true)) : [];
+    } catch (e) {
+      console.error('StorageService Error (loadImportantInfoCache AsyncStorage fallback):', e);
+      return [];
+    }
+  },
+
+  /**
+   * Pulls the newest Important Info cards from Firebase and updates SQLite.
+   */
+  async syncImportantInfoFromFirebase() {
+    const response = await fetch(IMPORTANT_INFO_ENDPOINT);
+    if (!response.ok) throw new Error(`Firebase info load failed: ${response.status}`);
+    const firebaseData = await response.json();
+    const items = sortImportantInfo(convertFirebaseObjectToArray(firebaseData).map(normalizeImportantInfoItem).filter((item) => item.deleted !== true));
+    await this.saveImportantInfoCache(items);
+    return items;
+  },
+
+  /**
+   * Loads shared reference cards such as ground cable tables or conduit fill notes.
+   * Local SQLite is read first for speed. Firebase refreshes in the background
+   * when local data already exists.
+   */
+  async loadImportantInfo() {
+    const cachedItems = await this.loadImportantInfoCache();
+
+    if (cachedItems.length > 0) {
+      this.syncImportantInfoFromFirebase().catch((error) => {
+        console.error('StorageService Background Important Info Sync Error:', error);
+      });
+      return cachedItems;
+    }
+
+    try {
+      return await this.syncImportantInfoFromFirebase();
+    } catch (e) {
+      console.error('StorageService Error (loadImportantInfo):', e);
+      return [];
+    }
+  },
+
+  /**
+   * Creates or updates one Important Info card. Images are saved the same way
+   * catalog images are saved: Firebase can keep a compressed data URI for syncing,
+   * but the local SQLite cache only stores a lightweight file path reference.
+   */
+  async saveImportantInfoItem(item) {
+    try {
+      await ensureSharedDataEditor();
+      const now = new Date().toISOString();
+      const userLabel = await getCurrentAuditUserLabel();
+      const normalized = normalizeImportantInfoItem({
+        ...item,
+        id: item.id || `info-${Date.now()}`,
+        createdAt: item.createdAt || now,
+        updatedAt: now,
+        createdBy: item.createdBy || userLabel,
+        updatedBy: userLabel,
+        deleted: false,
+        deletedAt: '',
+        deletedBy: ''
+      });
+
+      const infoUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/importantInfo/${normalized.id}.json`);
+      const response = await fetch(infoUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(normalized)
+      });
+      if (!response.ok) throw new Error(`Firebase info save failed: ${response.status}`);
+
+      const existingItems = await this.loadImportantInfo();
+      const withoutOldItem = existingItems.filter((currentItem) => currentItem.id !== normalized.id);
+      const updatedItems = sortImportantInfo([...withoutOldItem, normalized]);
+      await this.saveImportantInfoCache(updatedItems);
+      return normalized;
+    } catch (e) {
+      console.error('StorageService Error (saveImportantInfoItem):', e);
+      throw e;
+    }
+  },
+
+  /**
+   * Soft-deletes one Important Info card from Firebase and removes it from the local cache.
+   * The record is not permanently deleted, so accidental deletions can be recovered from Firebase.
+   */
+  async deleteImportantInfoItem(itemId) {
+    try {
+      await ensureSharedDataEditor();
+      if (!itemId) return false;
+      const now = new Date().toISOString();
+      const userLabel = await getCurrentAuditUserLabel();
+      const infoUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/importantInfo/${itemId}.json`);
+      const response = await fetch(infoUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deleted: true, deletedAt: now, deletedBy: userLabel, updatedAt: now, updatedBy: userLabel })
+      });
+      if (!response.ok) throw new Error(`Firebase info soft delete failed: ${response.status}`);
+      const existingItems = await this.loadImportantInfoCache();
+      await this.saveImportantInfoCache(existingItems.filter((item) => item.id !== itemId));
+      await removeImportantInfoRowFromSQLite(itemId);
+      return true;
+    } catch (e) {
+      console.error('StorageService Error (deleteImportantInfoItem):', e);
+      throw e;
+    }
+  },
+
+  /**
+   * Loads categories from local cache first, then syncs from Firebase.
+   */
+  async loadCategories() {
+    try {
+      const cached = await AsyncStorage.getItem(CATEGORIES_CACHE_KEY);
+      if (cached) {
+        // Background sync
+        StorageService.syncCategoriesFromFirebase().catch(console.error);
+        return JSON.parse(cached);
+      }
+      return await StorageService.syncCategoriesFromFirebase();
+    } catch (e) {
+      console.error('StorageService Error (loadCategories):', e);
+      return DEFAULT_CATEGORIES;
+    }
+  },
+
+  async syncCategoriesFromFirebase() {
+    try {
+      const idToken = await AuthService.getCurrentIdToken();
+      const authQuery = idToken ? `?auth=${idToken}` : '';
+      const response = await fetch(`${CATEGORIES_ENDPOINT}${authQuery}`);
+
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          // Some accounts may not have permission to read custom categories yet.
+          // Fall back quietly to local/default categories so the app keeps working offline.
+          return DEFAULT_CATEGORIES;
+        }
+        throw new Error(`Firebase categories load failed: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      let categories = DEFAULT_CATEGORIES;
+      if (data) {
+        // Firebase may store categories either as strings from older app builds
+        // or as objects like { name, isCustom, createdBy }. Support both so
+        // existing databases keep working after this update.
+        const remoteCategories = Object.values(data)
+          .map((categoryRecord) => (
+            typeof categoryRecord === 'string'
+              ? normalizeCategoryName(categoryRecord)
+              : normalizeCategoryName(categoryRecord?.name)
+          ))
+          .filter(Boolean);
+        categories = [...new Set([...DEFAULT_CATEGORIES, ...remoteCategories])].sort();
+      }
+
+      await AsyncStorage.setItem(CATEGORIES_CACHE_KEY, JSON.stringify(categories));
+      return categories;
+    } catch (e) {
+      console.error('StorageService Error (syncCategoriesFromFirebase):', e);
+      return DEFAULT_CATEGORIES;
+    }
+  },
+
+  async addCategory(newCategory) {
+    try {
+      const user = await AuthService.getCurrentUser();
+      const isOwner = user?.role === 'owner';
+
+      if (!isOwner) throw new Error('ONLY_OWNER_CAN_ADD_CATEGORIES');
+
+      const cleanCategory = normalizeCategoryName(newCategory);
+      if (!cleanCategory) throw new Error('EMPTY_CATEGORY');
+
+      const existing = await StorageService.loadCategories();
+      if (existing.map((category) => category.toLowerCase()).includes(cleanCategory.toLowerCase())) {
+        return existing;
+      }
+
+      const categoryKey = createCategoryKey(cleanCategory);
+      if (!categoryKey) throw new Error('INVALID_CATEGORY');
+
+      const now = new Date().toISOString();
+      const categoryUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/categories/${categoryKey}.json`);
+      const response = await fetch(categoryUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: cleanCategory,
+          isCustom: true,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: user?.uid || user?.email || 'owner',
+          updatedBy: user?.uid || user?.email || 'owner'
+        })
+      });
+
+      const updatedCategories = [...new Set([...existing, cleanCategory])].sort();
+      await AsyncStorage.setItem(CATEGORIES_CACHE_KEY, JSON.stringify(updatedCategories));
+
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'FIREBASE_CATEGORY_RULES_REQUIRED'
+          : `Firebase add category failed: ${response.status}`;
+        const error = new Error(message);
+        error.localCategories = updatedCategories;
+        throw error;
+      }
+
+      return await StorageService.syncCategoriesFromFirebase();
+    } catch (e) {
+      console.error('StorageService Error (addCategory):', e);
+      throw e;
+    }
+  },
+
+  async deleteCategory(categoryName) {
+    try {
+      const user = await AuthService.getCurrentUser();
+      const isOwner = user?.role === 'owner';
+
+      if (!isOwner) throw new Error('ONLY_OWNER_CAN_DELETE_CATEGORIES');
+
+      const cleanCategory = normalizeCategoryName(categoryName);
+      if (!cleanCategory) throw new Error('EMPTY_CATEGORY');
+
+      if (DEFAULT_CATEGORY_KEYS.includes(cleanCategory.toLowerCase())) {
+        throw new Error('DEFAULT_CATEGORY_CANNOT_BE_DELETED');
+      }
+
+      const categoryKey = createCategoryKey(cleanCategory);
+      if (!categoryKey) throw new Error('INVALID_CATEGORY');
+
+      const categoryUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/categories/${categoryKey}.json`);
+      const response = await fetch(categoryUrl, { method: 'DELETE' });
+
+      const existing = await StorageService.loadCategories();
+      const updatedCategories = existing.filter((category) => category.toLowerCase() !== cleanCategory.toLowerCase());
+      await AsyncStorage.setItem(CATEGORIES_CACHE_KEY, JSON.stringify(updatedCategories));
+
+      if (!response.ok) {
+        const message = response.status === 401 || response.status === 403
+          ? 'FIREBASE_CATEGORY_RULES_REQUIRED'
+          : `Firebase delete category failed: ${response.status}`;
+        const error = new Error(message);
+        error.localCategories = updatedCategories;
+        throw error;
+      }
+
+      return await StorageService.syncCategoriesFromFirebase();
+    } catch (e) {
+      console.error('StorageService Error (deleteCategory):', e);
+      throw e;
+    }
+  },
+
+  /**
+   * Soft-deletes a catalog material without permanently removing it from Firebase.
+   * This method is ready for a future Catalog Manager delete button, but it keeps
+   * the database protected because the original record remains recoverable.
+   */
+  async softDeleteMaterial(materialId) {
+    try {
+      await ensureSharedDataEditor();
+      if (!materialId) return false;
+      const now = new Date().toISOString();
+      const userLabel = await getCurrentAuditUserLabel();
+      const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
+      const response = await fetch(materialUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deleted: true, deletedAt: now, deletedBy: userLabel, updatedAt: now, updatedBy: userLabel })
+      });
+      if (!response.ok) throw new Error(`Firebase material soft delete failed: ${response.status}`);
+      const existingCatalog = await this.loadCatalogCache();
+      await this.saveCatalogCache(existingCatalog.filter((item) => item.id !== materialId));
+      await removeCatalogRowFromSQLite(materialId);
+      return true;
+    } catch (e) {
+      console.error('StorageService Error (softDeleteMaterial):', e);
+      throw e;
+    }
+  },
+
+  /**
+   * Permanently deletes a material from Firebase.
+   * This should only be called by an Owner/Admin after reviewing soft-deleted items.
+   */
+  async permanentDeleteMaterial(materialId) {
+    try {
+      const user = await AuthService.getCurrentUser();
+      const isOwner = user?.role === 'owner';
+
+      if (!isOwner) {
+        throw new Error('ONLY_OWNER_CAN_PERMANENTLY_DELETE');
+      }
+
+      if (!materialId) return false;
+      const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
+      const response = await fetch(materialUrl, {
+        method: 'DELETE'
+      });
+      if (!response.ok) throw new Error(`Firebase material permanent delete failed: ${response.status}`);
+
+      const existingCatalog = await this.loadCatalogCache();
+      await this.saveCatalogCache(existingCatalog.filter((item) => item.id !== materialId));
+      await removeCatalogRowFromSQLite(materialId);
+      return true;
+    } catch (e) {
+      console.error('StorageService Error (permanentDeleteMaterial):', e);
+      throw e;
+    }
+  },
+
+  /**
+   * Wipes only local data. It does not delete the Firebase catalog.
+   */
+  async clearAllData() {
+    try {
+      await AsyncStorage.multiRemove([DRAFT_KEY, CATALOG_CACHE_KEY, IMPORTANT_INFO_CACHE_KEY]);
+      try {
+        await runSQLiteWriteSafely(async () => {
+          const database = await getSQLiteDatabase();
+          await database.execAsync(`DELETE FROM ${CATALOG_TABLE_NAME}; DELETE FROM ${IMPORTANT_INFO_TABLE_NAME};`);
+        });
+      } catch (sqliteError) {
+        console.error('Error clearing SQLite cache:', sqliteError);
+      }
+      console.log('Local app data cleared. Firebase catalog was not deleted.');
+    } catch (e) {
+      console.error('Error clearing data:', e);
+    }
+  }
+};
