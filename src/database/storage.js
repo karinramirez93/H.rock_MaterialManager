@@ -70,13 +70,22 @@ const getMaterialDisplayName = (material) => {
 const FIREBASE_DATABASE_URL = FIREBASE_CONFIG.databaseURL;
 const MATERIALS_ENDPOINT = `${FIREBASE_DATABASE_URL}/materials.json`;
 const CATEGORIES_ENDPOINT = `${FIREBASE_DATABASE_URL}/categories.json`;
+const UNIT_MEASURES_ENDPOINT = `${FIREBASE_DATABASE_URL}/unitMeasures.json`;
 const IMPORTANT_INFO_ENDPOINT = `${FIREBASE_DATABASE_URL}/importantInfo.json`;
 const CATEGORIES_CACHE_KEY = '@material_categories_cache_v1';
+const UNIT_MEASURES_CACHE_KEY = '@material_unit_measures_cache_v1';
 const IMPORTANT_INFO_CACHE_KEY = '@important_info_cache_v1';
+const CATALOG_CACHE_SCHEMA_KEY = '@material_catalog_cache_schema_version';
+const CATALOG_CACHE_SCHEMA_VERSION = 'no-full-json-cache-v1';
 
+// Default catalog categories and unit measures. These are kept locally so the
+// app always works offline, and owner accounts can also seed them into Firebase
+// so all devices share the same master lists.
 const DEFAULT_CATEGORIES = ['Conduits', 'Connectors', 'Conductors', 'Devices', 'Boxes', 'Fittings', 'Tools', 'Others'];
 const DEFAULT_CATEGORY_KEYS = DEFAULT_CATEGORIES.map((category) => category.toLowerCase());
+const DEFAULT_UNIT_MEASURES = ['Unit', 'Box', 'Bundle', 'Reel', 'Length (ft)', 'Length (in)', 'Bottle'];
 const createCategoryKey = (category) => String(category || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+const createUnitMeasureKey = (unit) => String(unit || '').trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 const buildAuthenticatedFirebaseUrl = async (baseUrl) => {
   const idToken = await AuthService.getCurrentIdToken();
   if (!idToken) throw new Error('OWNER_SESSION_TOKEN_MISSING');
@@ -331,6 +340,7 @@ const normalizeMaterial = (material) => {
     category: material.category === 'Other' ? 'Others' : (material.category || 'Others'),
     size: normalizedLegacyFields.size || 'N/A',
     imageUri: material.imageUri || '',
+    groupCoverUri: material.groupCoverUri || '',
     description: material.description || '',
     forceShowDescription: material.forceShowDescription === true,
     keywords: buildAutomaticKeywords(material, normalizedLegacyFields),
@@ -339,11 +349,8 @@ const normalizeMaterial = (material) => {
     updatedAt: material.updatedAt || new Date().toISOString(),
     requestCount: Number(material.requestCount || 0),
     lastRequestedAt: material.lastRequestedAt || '',
-    deleted: material.deleted === true,
-    deletedAt: material.deletedAt || '',
     createdBy: material.createdBy || FALLBACK_USER_LABEL,
-    updatedBy: material.updatedBy || FALLBACK_USER_LABEL,
-    deletedBy: material.deletedBy || ''
+    updatedBy: material.updatedBy || FALLBACK_USER_LABEL
   };
 };
 
@@ -432,11 +439,8 @@ const normalizeImportantInfoItem = (item) => ({
   imageUri: item.imageUri || '',
   createdAt: item.createdAt || new Date().toISOString(),
   updatedAt: item.updatedAt || new Date().toISOString(),
-  deleted: item.deleted === true,
-  deletedAt: item.deletedAt || '',
   createdBy: item.createdBy || FALLBACK_USER_LABEL,
-  updatedBy: item.updatedBy || FALLBACK_USER_LABEL,
-  deletedBy: item.deletedBy || ''
+  updatedBy: item.updatedBy || FALLBACK_USER_LABEL
 });
 
 const sortImportantInfo = (items) => [...items].sort((a, b) => a.title.localeCompare(b.title));
@@ -541,12 +545,71 @@ const createFamilySharedImageCatalogCache = async (catalog) => {
   return preparedCatalog;
 };
 
+
+const isLocalFileOrRemoteImageReference = (value) => {
+  const text = String(value || '');
+  return text.startsWith('file://') || text.startsWith('content://') || text.startsWith('http://') || text.startsWith('https://');
+};
+
+// SQLite should never receive base64 image payloads. It is a local index/cache,
+// not an image store. Images should live in FileSystem or Firebase Storage, and
+// the catalog row should keep only the image reference. This protects the app
+// from SQLITE_FULL and CursorWindow row-size errors on Android.
+const createCatalogCacheRecord = (material) => {
+  const normalized = normalizeMaterial(material);
+  return {
+    ...normalized,
+    imageUri: isLocalFileOrRemoteImageReference(normalized.imageUri) ? normalized.imageUri : '',
+    groupCoverUri: isLocalFileOrRemoteImageReference(normalized.groupCoverUri) ? normalized.groupCoverUri : ''
+  };
+};
+
+const isSQLiteFullOrCorruptCacheError = (error) => {
+  const message = String(error?.message || error || '').toLowerCase();
+  return message.includes('sqlite_full') || message.includes('database or disk is full') || message.includes('cursorwindow') || message.includes('row too big') || message.includes('nullpointerexception');
+};
+
+const resetCatalogSQLiteCache = async () => {
+  try {
+    const database = await getSQLiteDatabase();
+    await database.execAsync(`
+      DROP TABLE IF EXISTS ${CATALOG_TABLE_NAME};
+      VACUUM;
+      CREATE TABLE IF NOT EXISTS ${CATALOG_TABLE_NAME} (
+        id TEXT PRIMARY KEY NOT NULL,
+        data TEXT NOT NULL,
+        updatedAt TEXT,
+        deleted INTEGER DEFAULT 0
+      );
+    `);
+  } catch (resetError) {
+    console.warn('StorageService Warning (resetCatalogSQLiteCache skipped):', resetError);
+  }
+};
+
+const ensureCatalogCacheSchema = async () => {
+  try {
+    const currentVersion = await AsyncStorage.getItem(CATALOG_CACHE_SCHEMA_KEY);
+    if (currentVersion === CATALOG_CACHE_SCHEMA_VERSION) return;
+
+    // Remove the old single-key AsyncStorage catalog because it can exceed the
+    // Android row limit when the catalog grows. SQLite now stores one material
+    // per row, and images are referenced instead of embedded.
+    await AsyncStorage.multiRemove([CATALOG_CACHE_KEY]);
+    await resetCatalogSQLiteCache();
+    await AsyncStorage.setItem(CATALOG_CACHE_SCHEMA_KEY, CATALOG_CACHE_SCHEMA_VERSION);
+  } catch (schemaError) {
+    console.warn('StorageService Warning (ensureCatalogCacheSchema skipped):', schemaError);
+  }
+};
+
 /**
  * Writes catalog rows into SQLite. Existing rows are replaced by id, which makes
  * the cache safe for repeated Firebase syncs and local edits.
  */
 const saveCatalogToSQLite = async (catalog) => {
   const familySharedCatalog = await createFamilySharedImageCatalogCache(catalog);
+  const cacheCatalog = familySharedCatalog.map(createCatalogCacheRecord);
 
   await runSQLiteWriteSafely(async () => {
     const database = await getSQLiteDatabase();
@@ -557,16 +620,20 @@ const saveCatalogToSQLite = async (catalog) => {
     // pull-to-refresh and background sync remove deleted cloud records too.
     await database.runAsync(`DELETE FROM ${CATALOG_TABLE_NAME};`);
 
+    // Explicitly reclaim space if we just performed a large delete.
+    // This solves the SQLITE_FULL error by returning unused pages to the OS.
+    await database.runAsync(`VACUUM;`);
+
     // Avoid withTransactionAsync here. On some Expo SQLite versions, a background
     // Firebase sync and a foreground user action can overlap and produce:
     // "cannot start a transaction within a transaction". Sequential runAsync
     // calls are slower than one transaction, but they are much safer for this
     // cache layer and they do not block the requisition workflow.
-    for (const material of familySharedCatalog || []) {
-      const normalized = normalizeMaterial(material);
+    for (const material of cacheCatalog || []) {
+      const normalized = createCatalogCacheRecord(material);
       await database.runAsync(
         `INSERT OR REPLACE INTO ${CATALOG_TABLE_NAME} (id, data, updatedAt, deleted) VALUES (?, ?, ?, ?);`,
-        [normalized.id, JSON.stringify(normalized), normalized.updatedAt || '', normalized.deleted ? 1 : 0]
+        [normalized.id, JSON.stringify(normalized), normalized.updatedAt || '', 0]
       );
     }
   });
@@ -577,8 +644,8 @@ const saveCatalogToSQLite = async (catalog) => {
  */
 const loadCatalogFromSQLite = async () => {
   const database = await getSQLiteDatabase();
-  const rows = await database.getAllAsync(`SELECT data FROM ${CATALOG_TABLE_NAME} WHERE deleted = 0;`);
-  return sortCatalog(rows.map((row) => normalizeMaterial(JSON.parse(row.data))).filter((material) => material.deleted !== true));
+  const rows = await database.getAllAsync(`SELECT data FROM ${CATALOG_TABLE_NAME};`);
+  return sortCatalog(rows.map((row) => normalizeMaterial(JSON.parse(row.data))));
 };
 
 /**
@@ -603,7 +670,7 @@ const saveImportantInfoToSQLite = async (items) => {
       const normalized = normalizeImportantInfoItem(item);
       await database.runAsync(
         `INSERT OR REPLACE INTO ${IMPORTANT_INFO_TABLE_NAME} (id, data, updatedAt, deleted) VALUES (?, ?, ?, ?);`,
-        [normalized.id, JSON.stringify(normalized), normalized.updatedAt || '', normalized.deleted ? 1 : 0]
+        [normalized.id, JSON.stringify(normalized), normalized.updatedAt || '', 0]
       );
     }
   });
@@ -611,8 +678,8 @@ const saveImportantInfoToSQLite = async (items) => {
 
 const loadImportantInfoFromSQLite = async () => {
   const database = await getSQLiteDatabase();
-  const rows = await database.getAllAsync(`SELECT data FROM ${IMPORTANT_INFO_TABLE_NAME} WHERE deleted = 0;`);
-  return sortImportantInfo(rows.map((row) => normalizeImportantInfoItem(JSON.parse(row.data))).filter((item) => item.deleted !== true));
+  const rows = await database.getAllAsync(`SELECT data FROM ${IMPORTANT_INFO_TABLE_NAME};`);
+  return sortImportantInfo(rows.map((row) => normalizeImportantInfoItem(JSON.parse(row.data))));
 };
 
 const removeImportantInfoRowFromSQLite = async (itemId) => {
@@ -685,14 +752,21 @@ export const StorageService = {
    */
   async saveCatalogCache(catalog) {
     try {
+      await ensureCatalogCacheSchema();
       const sortedCatalog = sortCatalog((catalog || []).map(normalizeMaterial));
-      const familySharedCatalog = await createFamilySharedImageCatalogCache(sortedCatalog);
-      await saveCatalogToSQLite(familySharedCatalog);
 
-      // AsyncStorage receives only local file references, never large base64
-      // images. This fallback stays lightweight even as the catalog grows.
-      await AsyncStorage.setItem(CATALOG_CACHE_KEY, JSON.stringify(familySharedCatalog));
+      // Do not keep a second full copy of the catalog in AsyncStorage. Android
+      // stores AsyncStorage in SQLite too, and one huge JSON row can trigger
+      // CursorWindow and SQLITE_FULL errors. The only local catalog cache is now
+      // the row-based SQLite table.
+      await AsyncStorage.removeItem(CATALOG_CACHE_KEY);
+      await saveCatalogToSQLite(sortedCatalog);
     } catch (e) {
+      if (isSQLiteFullOrCorruptCacheError(e)) {
+        console.warn('StorageService Warning (catalog cache reset after storage pressure):', e);
+        await resetCatalogSQLiteCache();
+        return;
+      }
       console.warn('StorageService Warning (saveCatalogCache skipped):', e);
     }
   },
@@ -702,19 +776,16 @@ export const StorageService = {
    */
   async loadCatalogCache() {
     try {
+      await ensureCatalogCacheSchema();
       const sqliteCatalog = await loadCatalogFromSQLite();
-      if (sqliteCatalog.length > 0) return sqliteCatalog;
+      return sqliteCatalog.length > 0 ? sqliteCatalog : [];
     } catch (sqliteError) {
-      console.error('StorageService Error (loadCatalogCache SQLite):', sqliteError);
-    }
-
-    try {
-      const jsonValue = await AsyncStorage.getItem(CATALOG_CACHE_KEY);
-      if (!jsonValue) return [];
-      const parsed = JSON.parse(jsonValue);
-      return Array.isArray(parsed) ? sortCatalog(parsed.map(normalizeMaterial).filter((material) => material.deleted !== true)) : [];
-    } catch (e) {
-      console.error('StorageService Error (loadCatalogCache AsyncStorage fallback):', e);
+      if (isSQLiteFullOrCorruptCacheError(sqliteError)) {
+        console.warn('StorageService Warning (catalog cache reset after load failure):', sqliteError);
+        await resetCatalogSQLiteCache();
+      } else {
+        console.error('StorageService Error (loadCatalogCache SQLite):', sqliteError);
+      }
       return [];
     }
   },
@@ -732,7 +803,7 @@ export const StorageService = {
     }
 
     const firebaseData = await response.json();
-    let catalog = convertFirebaseObjectToArray(firebaseData).map(normalizeMaterial).filter((material) => material.deleted !== true);
+    let catalog = convertFirebaseObjectToArray(firebaseData).map(normalizeMaterial);
 
     if (catalog.length === 0) {
       catalog = await this.seedInitialCatalog();
@@ -784,10 +855,7 @@ export const StorageService = {
         createdAt: material.createdAt || now,
         updatedAt: now,
         createdBy: material.createdBy || userLabel,
-        updatedBy: userLabel,
-        deleted: false,
-        deletedAt: '',
-        deletedBy: ''
+        updatedBy: userLabel
       });
 
       // Use the current local cache for duplicate checks so this write does not
@@ -862,10 +930,7 @@ export const StorageService = {
         createdAt: variant.createdAt || now,
         createdBy: variant.createdBy || userLabel,
         updatedAt: now,
-        updatedBy: userLabel,
-        deleted: variant.deleted === true,
-        deletedAt: variant.deletedAt || '',
-        deletedBy: variant.deletedBy || ''
+        updatedBy: userLabel
       }));
 
       const idsBeingUpdated = new Set(normalizedUpdates.map((item) => item.id));
@@ -946,10 +1011,7 @@ export const StorageService = {
         createdAt: materialChanges.createdAt || new Date().toISOString(),
         createdBy: materialChanges.createdBy || userLabel,
         updatedAt: new Date().toISOString(),
-        updatedBy: userLabel,
-        deleted: materialChanges.deleted === true,
-        deletedAt: materialChanges.deletedAt || '',
-        deletedBy: materialChanges.deletedBy || ''
+        updatedBy: userLabel
       });
 
       const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
@@ -1158,7 +1220,7 @@ export const StorageService = {
       const jsonValue = await AsyncStorage.getItem(IMPORTANT_INFO_CACHE_KEY);
       if (!jsonValue) return [];
       const parsed = JSON.parse(jsonValue);
-      return Array.isArray(parsed) ? sortImportantInfo(parsed.map(normalizeImportantInfoItem).filter((item) => item.deleted !== true)) : [];
+      return Array.isArray(parsed) ? sortImportantInfo(parsed.map(normalizeImportantInfoItem)) : [];
     } catch (e) {
       console.error('StorageService Error (loadImportantInfoCache AsyncStorage fallback):', e);
       return [];
@@ -1172,7 +1234,7 @@ export const StorageService = {
     const response = await fetch(IMPORTANT_INFO_ENDPOINT);
     if (!response.ok) throw new Error(`Firebase info load failed: ${response.status}`);
     const firebaseData = await response.json();
-    const items = sortImportantInfo(convertFirebaseObjectToArray(firebaseData).map(normalizeImportantInfoItem).filter((item) => item.deleted !== true));
+    const items = sortImportantInfo(convertFirebaseObjectToArray(firebaseData).map(normalizeImportantInfoItem));
     await this.saveImportantInfoCache(items);
     return items;
   },
@@ -1216,10 +1278,7 @@ export const StorageService = {
         createdAt: item.createdAt || now,
         updatedAt: now,
         createdBy: item.createdBy || userLabel,
-        updatedBy: userLabel,
-        deleted: false,
-        deletedAt: '',
-        deletedBy: ''
+        updatedBy: userLabel
       });
 
       const infoUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/importantInfo/${normalized.id}.json`);
@@ -1242,22 +1301,19 @@ export const StorageService = {
   },
 
   /**
-   * Soft-deletes one Important Info card from Firebase and removes it from the local cache.
-   * The record is not permanently deleted, so accidental deletions can be recovered from Firebase.
+   * Permanently deletes one Important Info card from Firebase and removes it from the local cache.
    */
   async deleteImportantInfoItem(itemId) {
     try {
-      await ensureSharedDataEditor();
+      const user = await AuthService.getCurrentUser();
+      if (user?.role !== 'owner') throw new Error('ONLY_OWNER_CAN_PERMANENTLY_DELETE');
+
       if (!itemId) return false;
-      const now = new Date().toISOString();
-      const userLabel = await getCurrentAuditUserLabel();
       const infoUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/importantInfo/${itemId}.json`);
       const response = await fetch(infoUrl, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deleted: true, deletedAt: now, deletedBy: userLabel, updatedAt: now, updatedBy: userLabel })
+        method: 'DELETE'
       });
-      if (!response.ok) throw new Error(`Firebase info soft delete failed: ${response.status}`);
+      if (!response.ok) throw new Error(`Firebase info delete failed: ${response.status}`);
       const existingItems = await this.loadImportantInfoCache();
       await this.saveImportantInfoCache(existingItems.filter((item) => item.id !== itemId));
       await removeImportantInfoRowFromSQLite(itemId);
@@ -1265,6 +1321,44 @@ export const StorageService = {
     } catch (e) {
       console.error('StorageService Error (deleteImportantInfoItem):', e);
       throw e;
+    }
+  },
+
+  /**
+   * Seeds default categories and unit measures in Firebase when the current
+   * user is an owner. This keeps global configuration centralized without
+   * preventing the app from working offline or under viewer/guest accounts.
+   */
+  async ensureDefaultCatalogSettingsInFirebase() {
+    try {
+      const user = await AuthService.getCurrentUser();
+      if (user?.role !== 'owner') return false;
+
+      const now = new Date().toISOString();
+      await Promise.all(DEFAULT_CATEGORIES.map(async (category) => {
+        const categoryKey = createCategoryKey(category);
+        const url = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/categories/${categoryKey}.json`);
+        await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: category, isCustom: false, protected: true, updatedAt: now })
+        });
+      }));
+
+      await Promise.all(DEFAULT_UNIT_MEASURES.map(async (unit) => {
+        const unitKey = createUnitMeasureKey(unit);
+        const url = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/unitMeasures/${unitKey}.json`);
+        await fetch(url, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: unit, isCustom: false, protected: true, updatedAt: now })
+        });
+      }));
+
+      return true;
+    } catch (error) {
+      console.warn('StorageService Warning (ensureDefaultCatalogSettingsInFirebase):', error);
+      return false;
     }
   },
 
@@ -1378,6 +1472,100 @@ export const StorageService = {
     }
   },
 
+  /**
+   * Loads unit measures from local cache first, then refreshes them from Firebase.
+   * Catalog selection screens use only the units saved on each material, while
+   * Add Material uses this master list to let owner/editor users select or add
+   * units for new catalog records.
+   */
+  async loadUnitMeasures() {
+    try {
+      const cached = await AsyncStorage.getItem(UNIT_MEASURES_CACHE_KEY);
+      if (cached) {
+        StorageService.syncUnitMeasuresFromFirebase().catch(console.error);
+        return JSON.parse(cached);
+      }
+      return await StorageService.syncUnitMeasuresFromFirebase();
+    } catch (e) {
+      console.error('StorageService Error (loadUnitMeasures):', e);
+      return DEFAULT_UNIT_MEASURES;
+    }
+  },
+
+  async syncUnitMeasuresFromFirebase() {
+    try {
+      const idToken = await AuthService.getCurrentIdToken();
+      const authQuery = idToken ? `?auth=${idToken}` : '';
+      const response = await fetch(`${UNIT_MEASURES_ENDPOINT}${authQuery}`);
+
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) return DEFAULT_UNIT_MEASURES;
+        throw new Error(`Firebase unit measures load failed: ${response.status}`);
+      }
+
+      const data = await response.json();
+      let unitMeasures = DEFAULT_UNIT_MEASURES;
+      if (data) {
+        const remoteUnits = Object.values(data)
+          .map((unitRecord) => (typeof unitRecord === 'string' ? String(unitRecord).trim() : String(unitRecord?.name || '').trim()))
+          .filter(Boolean);
+        unitMeasures = [...new Set([...DEFAULT_UNIT_MEASURES, ...remoteUnits])].sort();
+      }
+
+      await AsyncStorage.setItem(UNIT_MEASURES_CACHE_KEY, JSON.stringify(unitMeasures));
+      return unitMeasures;
+    } catch (e) {
+      console.error('StorageService Error (syncUnitMeasuresFromFirebase):', e);
+      return DEFAULT_UNIT_MEASURES;
+    }
+  },
+
+  async addUnitMeasure(newUnitMeasure) {
+    try {
+      await ensureSharedDataEditor();
+      const user = await AuthService.getCurrentUser();
+      const cleanUnit = String(newUnitMeasure || '').trim();
+      if (!cleanUnit) throw new Error('EMPTY_UNIT_MEASURE');
+
+      const existing = await StorageService.loadUnitMeasures();
+      if (existing.map((unit) => unit.toLowerCase()).includes(cleanUnit.toLowerCase())) {
+        return existing;
+      }
+
+      const unitKey = createUnitMeasureKey(cleanUnit);
+      if (!unitKey) throw new Error('INVALID_UNIT_MEASURE');
+
+      const now = new Date().toISOString();
+      const unitUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/unitMeasures/${unitKey}.json`);
+      const response = await fetch(unitUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: cleanUnit,
+          isCustom: true,
+          createdAt: now,
+          updatedAt: now,
+          createdBy: user?.uid || user?.email || 'editor',
+          updatedBy: user?.uid || user?.email || 'editor'
+        })
+      });
+
+      const updatedUnits = [...new Set([...existing, cleanUnit])].sort();
+      await AsyncStorage.setItem(UNIT_MEASURES_CACHE_KEY, JSON.stringify(updatedUnits));
+
+      if (!response.ok) {
+        const error = new Error(response.status === 401 || response.status === 403 ? 'FIREBASE_UNIT_RULES_REQUIRED' : `Firebase add unit failed: ${response.status}`);
+        error.localUnitMeasures = updatedUnits;
+        throw error;
+      }
+
+      return await StorageService.syncUnitMeasuresFromFirebase();
+    } catch (e) {
+      console.error('StorageService Error (addUnitMeasure):', e);
+      throw e;
+    }
+  },
+
   async deleteCategory(categoryName) {
     try {
       const user = await AuthService.getCurrentUser();
@@ -1419,34 +1607,6 @@ export const StorageService = {
   },
 
   /**
-   * Soft-deletes a catalog material without permanently removing it from Firebase.
-   * This method is ready for a future Catalog Manager delete button, but it keeps
-   * the database protected because the original record remains recoverable.
-   */
-  async softDeleteMaterial(materialId) {
-    try {
-      await ensureSharedDataEditor();
-      if (!materialId) return false;
-      const now = new Date().toISOString();
-      const userLabel = await getCurrentAuditUserLabel();
-      const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
-      const response = await fetch(materialUrl, {
-        method: 'PATCH',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ deleted: true, deletedAt: now, deletedBy: userLabel, updatedAt: now, updatedBy: userLabel })
-      });
-      if (!response.ok) throw new Error(`Firebase material soft delete failed: ${response.status}`);
-      const existingCatalog = await this.loadCatalogCache();
-      await this.saveCatalogCache(existingCatalog.filter((item) => item.id !== materialId));
-      await removeCatalogRowFromSQLite(materialId);
-      return true;
-    } catch (e) {
-      console.error('StorageService Error (softDeleteMaterial):', e);
-      throw e;
-    }
-  },
-
-  /**
    * Permanently deletes a material from Firebase.
    * This should only be called by an Owner/Admin after reviewing soft-deleted items.
    */
@@ -1479,13 +1639,18 @@ export const StorageService = {
   /**
    * Wipes only local data. It does not delete the Firebase catalog.
    */
+  async clearLocalCatalogCache() {
+    await resetCatalogSQLiteCache();
+    await AsyncStorage.multiRemove([CATALOG_CACHE_KEY, CATALOG_CACHE_SCHEMA_KEY]);
+  },
+
   async clearAllData() {
     try {
       await AsyncStorage.multiRemove([DRAFT_KEY, CATALOG_CACHE_KEY, IMPORTANT_INFO_CACHE_KEY]);
       try {
         await runSQLiteWriteSafely(async () => {
           const database = await getSQLiteDatabase();
-          await database.execAsync(`DELETE FROM ${CATALOG_TABLE_NAME}; DELETE FROM ${IMPORTANT_INFO_TABLE_NAME};`);
+          await database.execAsync(`DELETE FROM ${CATALOG_TABLE_NAME}; DELETE FROM ${IMPORTANT_INFO_TABLE_NAME}; VACUUM;`);
         });
       } catch (sqliteError) {
         console.error('Error clearing SQLite cache:', sqliteError);
@@ -1493,6 +1658,23 @@ export const StorageService = {
       console.log('Local app data cleared. Firebase catalog was not deleted.');
     } catch (e) {
       console.error('Error clearing data:', e);
+    }
+  },
+
+  /**
+   * Manually reclaims disk space by running SQLite VACUUM.
+   * Call this when large amounts of data (like photos) are removed.
+   */
+  async reclaimDiskSpace() {
+    try {
+      await runSQLiteWriteSafely(async () => {
+        const database = await getSQLiteDatabase();
+        await database.runAsync('VACUUM;');
+      });
+      return true;
+    } catch (error) {
+      console.error('StorageService Error (reclaimDiskSpace):', error);
+      return false;
     }
   }
 };

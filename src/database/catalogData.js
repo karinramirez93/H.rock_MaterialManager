@@ -354,7 +354,10 @@ const otherCatalog = [
   createMaterial({ name: 'Stainless Steel Uni-Strut', category: 'Others', description: 'Stainless steel strut channel for supporting conduit and equipment.', keywords: ['unistrut', 'uni-strut', 'strut', 'channel', 'stainless steel'], allowedUnits: ['Unit', 'Bundle'] }),
   createMaterial({ name: 'Galvanized Uni-Strut', category: 'Others', description: 'Galvanized strut channel for supporting conduit and equipment.', keywords: ['unistrut', 'uni-strut', 'strut', 'channel', 'galvanized'], allowedUnits: ['Unit', 'Bundle'] }),
   createMaterial({ name: 'UTP Cable', category: 'Conductors', size: 'Cat6', description: '', keywords: ['utp', 'cat6', 'network', 'data cable', 'ethernet', 'wire'], allowedUnits: ['Unit', 'Reel', 'Length (ft)'], familyName: 'UTP Cable' }),
-  createMaterial({ name: 'UTP Cable', category: 'Conductors', size: 'Cat5', description: '', keywords: ['utp', 'cat5', 'network', 'data cable', 'ethernet', 'wire'], allowedUnits: ['Unit', 'Reel', 'Length (ft)'], familyName: 'UTP Cable' })
+  createMaterial({ name: 'UTP Cable', category: 'Conductors', size: 'Cat5', description: '', keywords: ['utp', 'cat5', 'network', 'data cable', 'ethernet', 'wire'], allowedUnits: ['Unit', 'Reel', 'Length (ft)'], familyName: 'UTP Cable' }),
+  createMaterial({ name: 'Ty-Rap', category: 'Others', size: '8"', description: 'Standard 8-inch nylon cable tie.', keywords: ['ty-rap', 'ty rap', 'cable tie', 'tie wrap', 'zip tie'], allowedUnits: ['Unit', 'Box', 'Bundle'], familyName: 'Ty-Rap' }),
+  createMaterial({ name: 'Ty-Rap', category: 'Others', size: '12"', description: 'Standard 12-inch nylon cable tie.', keywords: ['ty-rap', 'ty rap', 'cable tie', 'tie wrap', 'zip tie'], allowedUnits: ['Unit', 'Box', 'Bundle'], familyName: 'Ty-Rap' }),
+  createMaterial({ name: 'Ty-Rap', category: 'Others', size: '14"', description: 'Heavy duty 14-inch nylon cable tie.', keywords: ['ty-rap', 'ty rap', 'cable tie', 'tie wrap', 'zip tie'], allowedUnits: ['Unit', 'Box', 'Bundle'], familyName: 'Ty-Rap' })
 ];
 
 export const initialCatalog = [

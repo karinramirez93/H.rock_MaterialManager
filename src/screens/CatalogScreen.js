@@ -15,10 +15,65 @@
  * the required material data is sent to the draft list.
  */
 import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react';
-import { StyleSheet, Text, View, FlatList, TextInput, TouchableOpacity, Modal, ActivityIndicator, Image, ScrollView, BackHandler, Alert, RefreshControl } from 'react-native';
+import { StyleSheet, Text, View, FlatList, TextInput, TouchableOpacity, Modal, ActivityIndicator, Image, ScrollView, BackHandler, Alert, RefreshControl, Dimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StorageService } from '../database/storage';
 import { useFocusEffect } from '@react-navigation/native';
+import { GestureHandlerRootView, GestureDetector, Gesture } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withSpring,
+} from 'react-native-reanimated';
+
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
+
+const ImageZoomModal = ({ visible, imageUri, onClose }) => {
+  const scale = useSharedValue(1);
+  const savedScale = useSharedValue(1);
+
+  const pinchGesture = Gesture.Pinch()
+    .onUpdate((event) => {
+      scale.value = savedScale.value * event.scale;
+    })
+    .onEnd(() => {
+      scale.value = withSpring(1);
+      savedScale.value = 1;
+    });
+
+  const rStyle = useAnimatedStyle(() => {
+    return {
+      transform: [{ scale: scale.value }],
+    };
+  });
+
+  if (!imageUri) return null;
+
+  return (
+    <Modal visible={visible} transparent animationType="fade">
+      <GestureHandlerRootView style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.9)' }}>
+        <TouchableOpacity
+          style={styles.zoomCloseButton}
+          onPress={onClose}
+        >
+          <Text style={styles.zoomCloseText}>✕ Close</Text>
+        </TouchableOpacity>
+        <GestureDetector gesture={pinchGesture}>
+          <Animated.View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+            <Animated.Image
+              source={{ uri: imageUri }}
+              style={[{ width: SCREEN_WIDTH, height: SCREEN_WIDTH, backgroundColor: '#000' }, rStyle]}
+              resizeMode="contain"
+            />
+          </Animated.View>
+        </GestureDetector>
+        <View style={styles.zoomInstruction}>
+          <Text style={styles.zoomInstructionText}>Pinch to zoom in/out</Text>
+        </View>
+      </GestureHandlerRootView>
+    </Modal>
+  );
+};
 
 const getMaterialDisplayName = (material) => {
   const sizeText = material?.size && material.size !== 'N/A' ? ` ${material.size}` : '';
@@ -95,6 +150,7 @@ const getSearchableMaterialText = (material) => (
   [
     getMaterialDisplayName(material),
     material?.name,
+    material?.familyName,
     material?.category,
     material?.size,
     material?.description,
@@ -356,6 +412,11 @@ const getMaterialFamilyKey = (material) => {
 // Picks the best image for a family. The first saved photo in any size variant becomes
 // the shared visual reference for the family card and the size-selection modal.
 const getSharedFamilyImageUri = (variants) => {
+  // Priority 1: Explicit group cover designated by the manager
+  const coverOwner = (variants || []).find((v) => Boolean(v?.groupCoverUri));
+  if (coverOwner?.groupCoverUri) return coverOwner.groupCoverUri;
+
+  // Priority 2: Fallback to the first variant image if no explicit cover is set
   const imageOwner = (variants || []).find((variant) => Boolean(variant?.imageUri));
   return imageOwner?.imageUri || '';
 };
@@ -423,8 +484,9 @@ const buildCatalogDisplayItems = (items) => {
     const firstVariant = sortedVariants[0] || {};
     const hasColorVariants = sortedVariants.some((variant) => isConductorColorFamily(variant)) && sortedVariants.length > 1;
     const hasSizeVariants = sortedVariants.some((variant) => variant?.size && variant.size !== 'N/A') && sortedVariants.length > 1;
+    const isExplicitFamily = Boolean(firstVariant.familyName) && sortedVariants.length > 1;
 
-    if (!hasColorVariants && !hasSizeVariants) {
+    if (!hasColorVariants && !hasSizeVariants && !isExplicitFamily) {
       return {
         ...firstVariant,
         variants: sortedVariants,
@@ -433,7 +495,7 @@ const buildCatalogDisplayItems = (items) => {
       };
     }
 
-    const familyMode = hasColorVariants ? 'color' : (isListStyleFamily(sortedVariants) ? 'list' : 'size');
+    const familyMode = hasColorVariants ? 'color' : (hasSizeVariants ? 'size' : 'list');
     const availableOptions = sortedVariants
       .map((variant) => getFamilyVariantLabel(variant, familyMode))
       .filter(Boolean);
@@ -445,9 +507,9 @@ const buildCatalogDisplayItems = (items) => {
       familyMode,
       familyKey,
       variants: sortedVariants,
-      name: hasColorVariants
+      name: firstVariant.familyName || (hasColorVariants
         ? getConductorFamilyDisplayName(firstVariant)
-        : firstVariant.name,
+        : firstVariant.name),
       size: 'N/A',
       imageUri: getSharedFamilyImageUri(sortedVariants),
       availableSizes: familyMode === 'size' ? availableOptions : [],
@@ -465,19 +527,19 @@ const buildCatalogDisplayItems = (items) => {
 const getDefaultAllowedUnitsByCategory = (category) => {
   switch ((category || '').toLowerCase()) {
     case 'conductors':
-      return ['Unit', 'Reel', 'Length (ft)', 'Length (in)', 'Bottle', 'Custom Unit'];
+      return ['Unit', 'Reel', 'Length (ft)', 'Length (in)', 'Bottle'];
     case 'conduits':
-      return ['Unit', 'Bundle', 'Length (ft)', 'Length (in)', 'Bottle', 'Custom Unit'];
+      return ['Unit', 'Bundle', 'Length (ft)', 'Length (in)', 'Bottle'];
     case 'devices':
-      return ['Unit', 'Box', 'Bottle', 'Custom Unit'];
+      return ['Unit', 'Box', 'Bottle'];
     case 'tools':
-      return ['Unit', 'Box', 'Bottle', 'Custom Unit'];
+      return ['Unit', 'Box', 'Bottle'];
     case 'boxes':
     case 'connectors':
     case 'fittings':
     case 'others':
     default:
-      return ['Unit', 'Box', 'Bundle', 'Bottle', 'Custom Unit'];
+      return ['Unit', 'Box', 'Bundle', 'Bottle'];
   }
 };
 
@@ -538,15 +600,20 @@ export default function CatalogScreen({ navigation, currentUser }) {
   const [selectedItem, setSelectedItem] = useState(null);
   const [selectedFamilyVariants, setSelectedFamilyVariants] = useState([]);
   const [selectedFamilyVariantIds, setSelectedFamilyVariantIds] = useState([]);
+  const [familyVariantQuantities, setFamilyVariantQuantities] = useState({});
   const [selectedItems, setSelectedItems] = useState([]);
   const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
   const [isAddingMultipleItems, setIsAddingMultipleItems] = useState(false);
+  const [zoomImageUri, setZoomImageUri] = useState('');
+  const [zoomVisible, setZoomVisible] = useState(false);
 
   const [quantity, setQuantity] = useState('1');
   const [unit, setUnit] = useState('Unit');
   const [lengthDetail, setLengthDetail] = useState('');
   const [note, setNote] = useState('');
   const [customUnit, setCustomUnit] = useState('');
+  const [useCustomUnit, setUseCustomUnit] = useState(false);
+  const [useBulkQuantity, setUseBulkQuantity] = useState(false);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / ITEMS_PER_PAGE));
   const paginatedMaterials = useMemo(() => {
@@ -736,7 +803,10 @@ export default function CatalogScreen({ navigation, currentUser }) {
       ? item.allowedUnits
       : getDefaultAllowedUnitsByCategory(item?.category);
     const normalizedUnits = units.includes('Rolls') ? units.map((currentUnit) => (currentUnit === 'Rolls' ? 'Reel' : currentUnit)) : units;
-    return [...new Set([...normalizedUnits, 'Bottle', 'Custom Unit'])];
+    // Do not append Custom Unit here. Catalog materials already define which
+    // units they should show. A separate checkbox below lets the user override
+    // with a one-time custom unit only when needed for the quantity sheet.
+    return [...new Set(normalizedUnits)];
   };
 
   // Builds the list of units available for multiple selected materials.
@@ -783,12 +853,15 @@ export default function CatalogScreen({ navigation, currentUser }) {
     setSelectedItem(item?.isFamilyGroup ? item : initialVariant);
     setSelectedFamilyVariants(variants);
     setSelectedFamilyVariantIds(item?.isFamilyGroup ? [] : (initialVariant?.id ? [initialVariant.id] : []));
+    setFamilyVariantQuantities(item?.isFamilyGroup ? {} : (initialVariant?.id ? { [initialVariant.id]: '1' } : {}));
     setSelectedItems([]);
     setIsAddingMultipleItems(false);
     setQuantity('1');
     setUnit(units[0] || 'Unit');
     setLengthDetail('');
     setCustomUnit('');
+    setUseCustomUnit(false);
+    setUseBulkQuantity(false);
     setNote('');
     setModalVisible(true);
   };
@@ -802,6 +875,16 @@ export default function CatalogScreen({ navigation, currentUser }) {
       const nextIds = alreadySelected
         ? currentIds.filter((currentId) => currentId !== variantId)
         : [...currentIds, variantId];
+
+      if (!alreadySelected) {
+        setFamilyVariantQuantities(prev => ({ ...prev, [variantId]: quantity || '1' }));
+      } else {
+        setFamilyVariantQuantities(prev => {
+          const next = { ...prev };
+          delete next[variantId];
+          return next;
+        });
+      }
 
       // We no longer force at least one selection. If the user taps a selected
       // item again, it will be deselected, allowing for an empty selection state.
@@ -858,6 +941,8 @@ export default function CatalogScreen({ navigation, currentUser }) {
     setUnit(commonUnits[0] || 'Unit');
     setLengthDetail('');
     setCustomUnit('');
+    setUseCustomUnit(false);
+    setUseBulkQuantity(false);
     setNote('');
     setModalVisible(true);
   };
@@ -880,6 +965,10 @@ export default function CatalogScreen({ navigation, currentUser }) {
     }
 
     const quantityNumber = isLengthUnit ? 1 : (parseInt(quantity, 10) || 1);
+    if (useCustomUnit && !customUnit.trim()) {
+      Alert.alert('Custom Unit Required', 'Please type the custom unit or uncheck Custom Unit.');
+      return;
+    }
     const normalizedLengthDetail = normalizeLengthDetailForUnit(lengthDetail, unit);
     const selectedFamilyItems = selectedFamilyVariantIds.length > 0
       ? selectedFamilyVariants.filter((variant) => selectedFamilyVariantIds.includes(variant.id))
@@ -888,13 +977,16 @@ export default function CatalogScreen({ navigation, currentUser }) {
     // If the user selected several colors or several sizes from one family card,
     // each selected option is sent as an individual row to the Material Quantity Sheet.
     if (selectedFamilyItems.length > 1) {
-      const newItems = selectedFamilyItems.map((item) => ({
-        material: buildDraftMaterial(item),
-        quantity: quantityNumber,
-        unit: resolvedUnit,
-        lengthDetail: (unit === 'Length (ft)' || unit === 'Length (in)' || unit === 'Reel') ? normalizedLengthDetail : '',
-        description: note
-      }));
+      const newItems = selectedFamilyItems.map((item) => {
+        const itemQty = isLengthUnit ? 1 : (parseInt(familyVariantQuantities[item.id], 10) || 1);
+        return {
+          material: buildDraftMaterial(item),
+          quantity: itemQty,
+          unit: resolvedUnit,
+          lengthDetail: (unit === 'Length (ft)' || unit === 'Length (in)' || unit === 'Reel') ? normalizedLengthDetail : '',
+          description: note
+        };
+      });
 
       navigation.reset({
         index: 0,
@@ -903,9 +995,12 @@ export default function CatalogScreen({ navigation, currentUser }) {
 
       setModalVisible(false);
       setSelectedFamilyVariantIds([]);
+      setFamilyVariantQuantities({});
       await StorageService.incrementMaterialRequestCount(selectedFamilyItems.map((item) => item.id));
       return;
     }
+
+    const finalQty = isLengthUnit ? 1 : (parseInt(familyVariantQuantities[selectedFamilyItems[0]?.id] || quantity, 10) || 1);
 
     // Reset the navigation stack when returning to the main Draft screen.
     // This prevents repeated Draft/Catalog pages from accumulating if the user
@@ -917,7 +1012,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
         params: {
           newItem: {
             material: buildDraftMaterial(selectedFamilyItems[0] || selectedItem),
-            quantity: quantityNumber,
+            quantity: finalQty,
             unit: resolvedUnit,
             lengthDetail: (unit === 'Length (ft)' || unit === 'Length (in)' || unit === 'Reel') ? normalizedLengthDetail : '',
             description: note
@@ -927,6 +1022,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
     });
     setModalVisible(false);
     setSelectedFamilyVariantIds([]);
+    setFamilyVariantQuantities({});
     await StorageService.incrementMaterialRequestCount([(selectedFamilyItems[0] || selectedItem).id]);
   };
 
@@ -935,12 +1031,16 @@ export default function CatalogScreen({ navigation, currentUser }) {
   const handleMultipleAddConfirm = async () => {
     if (selectedItems.length === 0) return;
     const quantityNumber = isLengthUnit ? 1 : (parseInt(quantity, 10) || 1);
+    if (useCustomUnit && !customUnit.trim()) {
+      Alert.alert('Custom Unit Required', 'Please type the custom unit or uncheck Custom Unit.');
+      return;
+    }
     const normalizedLengthDetail = normalizeLengthDetailForUnit(lengthDetail, unit);
     const newItems = selectedItems.map((item) => ({
       material: buildDraftMaterial(item),
       quantity: quantityNumber,
       unit: resolvedUnit,
-      lengthDetail: (unit === 'Length (ft)' || unit === 'Length (in)' || unit === 'Reel') ? lengthDetail : '',
+      lengthDetail: (unit === 'Length (ft)' || unit === 'Length (in)' || unit === 'Reel') ? normalizedLengthDetail : '',
       description: note
     }));
 
@@ -960,14 +1060,85 @@ export default function CatalogScreen({ navigation, currentUser }) {
 
   // Increases the modal quantity using buttons so the user does not need to rely only on the keyboard.
   const increaseQuantity = () => {
-    const currentQuantity = parseInt(quantity, 10) || 1;
-    setQuantity(String(currentQuantity + 1));
+    if (selectedFamilyVariantIds.length > 1) {
+      // Multiple items selected: if bulk adjust is active, increment every item by 1
+      if (useBulkQuantity) {
+        setFamilyVariantQuantities(prev => {
+          const next = { ...prev };
+          selectedFamilyVariantIds.forEach(id => {
+            const currentVal = parseInt(next[id] || '1', 10);
+            next[id] = String(currentVal + 1);
+          });
+          return next;
+        });
+      }
+    } else {
+      // Single item mode
+      const currentQuantity = parseInt(quantity, 10) || 1;
+      const nextVal = String(currentQuantity + 1);
+      setQuantity(nextVal);
+      if (selectedFamilyVariantIds[0]) {
+        updateVariantQuantity(selectedFamilyVariantIds[0], nextVal);
+      }
+    }
   };
 
   // Decreases the modal quantity but never allows a value lower than 1.
   const decreaseQuantity = () => {
-    const currentQuantity = parseInt(quantity, 10) || 1;
-    setQuantity(String(Math.max(1, currentQuantity - 1)));
+    if (selectedFamilyVariantIds.length > 1) {
+      // Multiple items selected: if bulk adjust is active, decrement every item by 1 (min 1)
+      if (useBulkQuantity) {
+        setFamilyVariantQuantities(prev => {
+          const next = { ...prev };
+          selectedFamilyVariantIds.forEach(id => {
+            const currentVal = parseInt(next[id] || '1', 10);
+            next[id] = String(Math.max(1, currentVal - 1));
+          });
+          return next;
+        });
+      }
+    } else {
+      // Single item mode
+      const currentQuantity = parseInt(quantity, 10) || 1;
+      const nextVal = String(Math.max(1, currentQuantity - 1));
+      setQuantity(nextVal);
+      if (selectedFamilyVariantIds[0]) {
+        updateVariantQuantity(selectedFamilyVariantIds[0], nextVal);
+      }
+    }
+  };
+
+  const handleBulkQuantityInputChange = (val) => {
+    setQuantity(val);
+    if (selectedFamilyVariantIds.length > 1) {
+      if (useBulkQuantity) {
+        // If bulk adjust is active, applying a manual number sets ALL to that number
+        const next = {};
+        selectedFamilyVariantIds.forEach(id => {
+          next[id] = val;
+        });
+        setFamilyVariantQuantities(prev => ({ ...prev, ...next }));
+      }
+    } else {
+      // Single selection: manual typing updates the only variant
+      if (selectedFamilyVariantIds[0]) {
+        updateVariantQuantity(selectedFamilyVariantIds[0], val);
+      }
+    }
+  };
+
+  const updateVariantQuantity = (variantId, newQty) => {
+    setFamilyVariantQuantities(prev => ({ ...prev, [variantId]: newQty }));
+  };
+
+  const incrementVariantQuantity = (variantId) => {
+    const current = parseInt(familyVariantQuantities[variantId] || '1', 10);
+    updateVariantQuantity(variantId, String(current + 1));
+  };
+
+  const decrementVariantQuantity = (variantId) => {
+    const current = parseInt(familyVariantQuantities[variantId] || '1', 10);
+    updateVariantQuantity(variantId, String(Math.max(1, current - 1)));
   };
 
   const handleAddConfirm = async () => {
@@ -978,6 +1149,11 @@ export default function CatalogScreen({ navigation, currentUser }) {
     }
   };
 
+  const openZoom = (uri) => {
+    if (!uri) return;
+    setZoomImageUri(uri);
+    setZoomVisible(true);
+  };
   const activeModalItems = isAddingMultipleItems
     ? selectedItems
     : (
@@ -986,7 +1162,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
           : (selectedItem ? [selectedItem] : [])
       );
   const activeAllowedUnits = isAddingMultipleItems ? getCommonAllowedUnits(selectedItems) : getAllowedUnits(selectedItem);
-  const resolvedUnit = unit === 'Custom Unit' ? (customUnit.trim() || 'Custom Unit') : unit;
+  const resolvedUnit = useCustomUnit ? (customUnit.trim() || 'Custom Unit') : unit;
   const isLengthUnit = unit === 'Length (ft)' || unit === 'Length (in)';
   const shouldShowQuantityStep = !isLengthUnit;
   const sharedModalImageUri = selectedItem?.imageUri || getSharedFamilyImageUri(selectedFamilyVariants);
@@ -1068,7 +1244,11 @@ export default function CatalogScreen({ navigation, currentUser }) {
                   <Text style={styles.checkboxText}>{isSelected ? '✓' : ''}</Text>
                 </View>
               ) : null}
-              {item.imageUri ? <Image source={{ uri: item.imageUri }} style={styles.thumbnail} /> : <View style={styles.thumbnailPlaceholder}><Text style={styles.thumbnailPlaceholderText}>No Photo</Text></View>}
+              {item.imageUri ? (
+                <TouchableOpacity onPress={() => openZoom(item.imageUri)}>
+                  <Image source={{ uri: item.imageUri }} style={styles.thumbnail} />
+                </TouchableOpacity>
+              ) : <View style={styles.thumbnailPlaceholder}><Text style={styles.thumbnailPlaceholderText}>No Photo</Text></View>}
               <View style={{ flex: 1 }}>
                 <Text style={styles.itemName}>{displayName}</Text>
                 <Text style={styles.itemCategory}>{item.category}</Text>
@@ -1189,7 +1369,13 @@ export default function CatalogScreen({ navigation, currentUser }) {
                       const previewDescription = getSelectionPreviewDescription(item);
                       return (
                         <View key={`${item.id || item.name || 'selected-material'}-${index}`} style={styles.selectedMaterialRow}>
-                          <View style={[styles.materialColorDot, { backgroundColor: getMaterialColorCode(item) }]} />
+                          {item.imageUri ? (
+                            <TouchableOpacity onPress={() => openZoom(item.imageUri)}>
+                              <Image source={{ uri: item.imageUri }} style={styles.selectedMaterialThumbnail} />
+                            </TouchableOpacity>
+                          ) : (
+                            <View style={[styles.materialColorDot, { backgroundColor: getMaterialColorCode(item) }]} />
+                          )}
                           <View style={styles.selectedMaterialInfo}>
                             <Text style={styles.selectedMaterialText} numberOfLines={1}>{getMaterialDisplayName(item)}</Text>
                             {previewDescription ? (
@@ -1201,6 +1387,31 @@ export default function CatalogScreen({ navigation, currentUser }) {
                               </Text>
                             ) : null}
                           </View>
+
+                          {!isAddingMultipleItems && !isLengthUnit && selectedFamilyVariants.length > 1 && (
+                            <View style={styles.miniStepper}>
+                              <TouchableOpacity
+                                style={styles.miniStepperButton}
+                                onPress={() => decrementVariantQuantity(item.id)}
+                              >
+                                <Text style={styles.miniStepperButtonText}>−</Text>
+                              </TouchableOpacity>
+                              <TextInput
+                                style={styles.miniStepperInput}
+                                keyboardType="numeric"
+                                value={String(familyVariantQuantities[item.id] || '1')}
+                                onChangeText={(val) => updateVariantQuantity(item.id, val)}
+                                textAlign="center"
+                              />
+                              <TouchableOpacity
+                                style={styles.miniStepperButton}
+                                onPress={() => incrementVariantQuantity(item.id)}
+                              >
+                                <Text style={styles.miniStepperButtonText}>+</Text>
+                              </TouchableOpacity>
+                            </View>
+                          )}
+
                           {isAddingMultipleItems ? (
                             <TouchableOpacity
                               style={styles.removeSelectedButton}
@@ -1217,10 +1428,6 @@ export default function CatalogScreen({ navigation, currentUser }) {
                   {!isAddingMultipleItems && selectedItem?.description ? (
                     <Text style={styles.selectedDescription}>Description is shown above for selection only. It will not be added to the Material Quantity Sheet.</Text>
                   ) : null}
-
-                  {!isAddingMultipleItems && sharedModalImageUri ? (
-                    <Image source={{ uri: sharedModalImageUri }} style={styles.modalImage} resizeMode="contain" />
-                  ) : null}
                 </View>
 
                 {!isAddingMultipleItems && selectedFamilyVariants.length > 1 ? (
@@ -1234,7 +1441,42 @@ export default function CatalogScreen({ navigation, currentUser }) {
                           : 'Choose one or more trade sizes. Each selected size will be added as an individual line.'}
                     </Text>
 
-                    {selectedItem?.category === 'Conductors' ? (
+                    {selectedFamilyVariants.some(v => v.imageUri) ? (
+                      <View style={styles.subCatalogGrid}>
+                        {selectedFamilyVariants.map((variant) => {
+                          const isVariantSelected = selectedFamilyVariantIds.includes(variant.id);
+                          const variantLabel = getFamilyVariantLabel(variant, selectedItem?.familyMode);
+
+                          return (
+                            <TouchableOpacity
+                              key={variant.id}
+                              style={[styles.subCatalogCard, isVariantSelected && styles.subCatalogCardActive]}
+                              onPress={() => toggleFamilyVariant(variant)}
+                            >
+                              <View style={styles.subCatalogImageContainer}>
+                                {variant.imageUri ? (
+                                  <Image source={{ uri: variant.imageUri }} style={styles.subCatalogImage} />
+                                ) : (
+                                  <View style={styles.subCatalogPlaceholder}>
+                                    <Text style={styles.subCatalogPlaceholderText}>No Photo</Text>
+                                  </View>
+                                )}
+                                {isVariantSelected && (
+                                  <View style={styles.subCatalogCheckBadge}>
+                                    <Text style={styles.subCatalogCheckText}>✓</Text>
+                                  </View>
+                                )}
+                              </View>
+                              <View style={styles.subCatalogInfo}>
+                                <Text style={[styles.subCatalogText, isVariantSelected && styles.subCatalogTextActive]} numberOfLines={2}>
+                                  {variantLabel}
+                                </Text>
+                              </View>
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+                    ) : selectedItem?.category === 'Conductors' ? (
                       <View style={styles.colorSelectionGrid}>
                         {selectedFamilyVariants.map((variant) => {
                           const variantLabel = getFamilyVariantLabel(variant, 'color');
@@ -1307,34 +1549,62 @@ export default function CatalogScreen({ navigation, currentUser }) {
                 ) : null}
 
                 {shouldShowQuantityStep ? (
-                <View style={styles.modalSection}>
-                  <Text style={styles.sectionTitle}>{!isAddingMultipleItems && selectedFamilyVariants.length > 1 ? '3' : '2'}. Quantity for Each Material</Text>
-                  <View style={styles.quantityInfoRow}>
+                <View style={[styles.modalSection, selectedFamilyVariantIds.length > 1 && !useBulkQuantity && styles.disabledSection]}>
+                  <View style={styles.sectionHeaderRow}>
+                    <Text style={styles.sectionTitle}>{!isAddingMultipleItems && selectedFamilyVariants.length > 1 ? '3' : '2'}. Quantity for Each Material</Text>
+                    {selectedFamilyVariantIds.length > 1 && (
+                      <TouchableOpacity
+                        style={[styles.bulkToggle, useBulkQuantity && styles.bulkToggleActive]}
+                        onPress={() => setUseBulkQuantity(!useBulkQuantity)}
+                      >
+                        <Text style={[styles.bulkToggleText, useBulkQuantity && styles.bulkToggleTextActive]}>
+                          {useBulkQuantity ? '☑ Bulk Adjust' : '☐ Bulk Adjust'}
+                        </Text>
+                      </TouchableOpacity>
+                    )}
+                  </View>
+
+                  <View style={[styles.quantityInfoRow, selectedFamilyVariantIds.length > 1 && !useBulkQuantity && { opacity: 0.5 }]}>
                     <View style={styles.quantityColumn}>
                       <View style={styles.quantityStepper}>
-                        <TouchableOpacity style={styles.quantityButton} onPress={decreaseQuantity}>
+                        <TouchableOpacity
+                          style={styles.quantityButton}
+                          onPress={decreaseQuantity}
+                          disabled={selectedFamilyVariantIds.length > 1 && !useBulkQuantity}
+                        >
                           <Text style={styles.quantityButtonText}>−</Text>
                         </TouchableOpacity>
                         <TextInput
                           style={styles.quantityInput}
                           keyboardType="numeric"
                           value={quantity}
-                          onChangeText={setQuantity}
+                          onChangeText={handleBulkQuantityInputChange}
                           textAlign="center"
+                          editable={!(selectedFamilyVariantIds.length > 1 && !useBulkQuantity)}
                         />
-                        <TouchableOpacity style={styles.quantityButton} onPress={increaseQuantity}>
+                        <TouchableOpacity
+                          style={styles.quantityButton}
+                          onPress={increaseQuantity}
+                          disabled={selectedFamilyVariantIds.length > 1 && !useBulkQuantity}
+                        >
                           <Text style={styles.quantityButtonText}>+</Text>
                         </TouchableOpacity>
                       </View>
                       <Text style={styles.exampleTitle}>Example</Text>
                       <Text style={styles.exampleText}>
-                        If you enter {quantity || '1'}, each material above will be added with quantity {quantity || '1'}.
+                        {selectedFamilyVariantIds.length > 1
+                          ? 'Adjusting this will add/subtract from ALL selected materials above.'
+                          : `If you enter ${quantity || '1'}, each material above will be added with quantity ${quantity || '1'}.`}
                       </Text>
                     </View>
 
                     <View style={styles.howItWorksBox}>
                       <Text style={styles.howItWorksTitle}>ⓘ  How it works</Text>
-                      <Text style={styles.howItWorksText}>The quantity you enter will be applied to each selected material.</Text>
+                      <Text style={styles.howItWorksText}>
+                        {selectedFamilyVariantIds.length > 1
+                          ? 'Activate "Bulk Adjust" to apply a global change to all selected items at once.'
+                          : 'The quantity you enter will be applied to each selected material.'}
+                      </Text>
                     </View>
                   </View>
                 </View>
@@ -1361,10 +1631,19 @@ export default function CatalogScreen({ navigation, currentUser }) {
                   </View>
                   <Text style={styles.unitHint}>ⓘ  “Reel” will change to “Reels” when quantity is more than 1.</Text>
 
-                  {unit === 'Custom Unit' ? (
+                  <TouchableOpacity
+                    style={[styles.customUnitToggle, useCustomUnit && styles.customUnitToggleActive]}
+                    onPress={() => setUseCustomUnit((current) => !current)}
+                  >
+                    <Text style={[styles.customUnitToggleText, useCustomUnit && styles.customUnitToggleTextActive]}>
+                      {useCustomUnit ? '☑ Use custom unit for this request' : '☐ Use custom unit for this request'}
+                    </Text>
+                  </TouchableOpacity>
+
+                  {useCustomUnit ? (
                     <TextInput
                       style={styles.lengthInput}
-                      placeholder="Type custom unit, e.g.: Bottle, Pack, Pair"
+                      placeholder="Type one-time unit, e.g.: Pack, Pair, Can"
                       placeholderTextColor="#6b7280"
                       value={customUnit}
                       onChangeText={setCustomUnit}
@@ -1414,6 +1693,12 @@ export default function CatalogScreen({ navigation, currentUser }) {
           </SafeAreaView>
         </View>
       </Modal>
+
+      <ImageZoomModal
+        visible={zoomVisible}
+        imageUri={zoomImageUri}
+        onClose={() => setZoomVisible(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -1537,6 +1822,10 @@ const styles = StyleSheet.create({
   unitTextActive: { color: '#fff' },
   unitCheck: { color: '#fff', fontSize: 15, marginLeft: 8, fontWeight: '900' },
   unitHint: { color: '#6b7280', fontSize: 11, marginTop: 4 },
+  customUnitToggle: { marginTop: 10, backgroundColor: '#fff', borderWidth: 1, borderColor: '#b8c4d6', borderRadius: 7, padding: 10 },
+  customUnitToggleActive: { backgroundColor: '#e6f0ff', borderColor: '#0867df' },
+  customUnitToggleText: { color: '#111827', fontWeight: '800', fontSize: 12 },
+  customUnitToggleTextActive: { color: '#0867df' },
   lengthInput: { marginTop: 10, borderWidth: 1, borderColor: '#b8c4d6', borderRadius: 7, paddingHorizontal: 10, height: 42, color: '#111827', backgroundColor: '#fff' },
   noteTitleRow: { flexDirection: 'row', alignItems: 'center' },
   optionalText: { fontWeight: '500', color: '#075bc7' },
@@ -1724,4 +2013,178 @@ const styles = StyleSheet.create({
   pageButtonText: { color: '#64ffda', fontWeight: '700', fontSize: 12 },
   pageInfo: { color: '#ccd6f6', fontWeight: '700', fontSize: 12, paddingHorizontal: 4 },
 
+  selectedMaterialThumbnail: {
+    width: 40,
+    height: 40,
+    borderRadius: 6,
+    marginRight: 10,
+    backgroundColor: '#e5e7eb'
+  },
+  gridThumbnail: {
+    width: 24,
+    height: 24,
+    borderRadius: 4,
+    marginBottom: 2,
+    backgroundColor: '#f3f4f6'
+  },
+  zoomCloseButton: {
+    position: 'absolute',
+    top: 50,
+    right: 20,
+    zIndex: 100,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    padding: 10,
+    borderRadius: 8
+  },
+  zoomCloseText: {
+    color: '#fff',
+    fontWeight: 'bold'
+  },
+  zoomInstruction: {
+    position: 'absolute',
+    bottom: 50,
+    width: '100%',
+    alignItems: 'center'
+  },
+  zoomInstructionText: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 12
+  },
+
+  miniStepper: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 6,
+    overflow: 'hidden',
+    backgroundColor: '#fff',
+    marginLeft: 8
+  },
+  miniStepperButton: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    backgroundColor: '#f1f5f9'
+  },
+  miniStepperButtonText: {
+    fontSize: 16,
+    fontWeight: 'bold',
+    color: '#075bc7'
+  },
+  miniStepperInput: {
+    width: 32,
+    fontSize: 13,
+    fontWeight: 'bold',
+    color: '#1e293b',
+    padding: 0
+  },
+
+  // Sub-Catalog Layout Styles
+  subCatalogGrid: {
+    flexDirection: 'row',
+    flexWrap: 'wrap',
+    gap: 12,
+    marginTop: 10,
+    justifyContent: 'space-between',
+    paddingHorizontal: 2
+  },
+  subCatalogCard: {
+    width: '47%',
+    backgroundColor: '#fff',
+    borderRadius: 12,
+    borderWidth: 1,
+    borderColor: '#dbe3ef',
+    overflow: 'hidden',
+    marginBottom: 4,
+    elevation: 2,
+    shadowColor: '#000',
+    shadowOpacity: 0.1,
+    shadowRadius: 3,
+    shadowOffset: { width: 0, height: 1 }
+  },
+  subCatalogCardActive: {
+    borderColor: '#0867df',
+    borderWidth: 2,
+    backgroundColor: '#eff6ff'
+  },
+  subCatalogImageContainer: {
+    width: '100%',
+    height: 100,
+    backgroundColor: '#f8fafc',
+    position: 'relative',
+    justifyContent: 'center',
+    alignItems: 'center'
+  },
+  subCatalogImage: {
+    width: '100%',
+    height: '100%',
+    resizeMode: 'contain'
+  },
+  subCatalogPlaceholder: {
+    alignItems: 'center',
+    justifyContent: 'center'
+  },
+  subCatalogPlaceholderText: {
+    color: '#94a3b8',
+    fontSize: 10,
+    fontWeight: 'bold'
+  },
+  subCatalogInfo: {
+    padding: 8,
+    alignItems: 'center',
+    minHeight: 44,
+    justifyContent: 'center'
+  },
+  subCatalogText: {
+    fontSize: 12,
+    fontWeight: '800',
+    color: '#1e293b',
+    textAlign: 'center'
+  },
+  subCatalogTextActive: {
+    color: '#0867df'
+  },
+  subCatalogCheckBadge: {
+    position: 'absolute',
+    top: 6,
+    right: 6,
+    backgroundColor: '#10b981',
+    width: 22,
+    height: 22,
+    borderRadius: 11,
+    justifyContent: 'center',
+    alignItems: 'center',
+    borderWidth: 1.5,
+    borderColor: '#fff',
+    elevation: 3
+  },
+  subCatalogCheckText: {
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: 'bold'
+  },
+  bulkToggle: {
+    backgroundColor: '#f1f5f9',
+    paddingHorizontal: 10,
+    paddingVertical: 5,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#cbd5e1'
+  },
+  bulkToggleActive: {
+    backgroundColor: '#eff6ff',
+    borderColor: '#0275d8'
+  },
+  bulkToggleText: {
+    fontSize: 11,
+    fontWeight: 'bold',
+    color: '#475569'
+  },
+  bulkToggleTextActive: {
+    color: '#0275d8'
+  },
+  disabledSection: {
+    borderColor: '#e5eaf2',
+    backgroundColor: '#f9fafb'
+  }
 });

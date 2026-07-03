@@ -8,12 +8,67 @@
  * shared family information: image, name, description, category, and units.
  */
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { StyleSheet, Text, View, FlatList, TextInput, TouchableOpacity, Modal, ActivityIndicator, Image, Alert, ScrollView, BackHandler, RefreshControl, KeyboardAvoidingView, Platform } from 'react-native';
+import { StyleSheet, Text, View, FlatList, TextInput, TouchableOpacity, Modal, ActivityIndicator, Image, Alert, ScrollView, BackHandler, RefreshControl, KeyboardAvoidingView, Platform, Dimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StorageService } from '../database/storage';
 import { useFocusEffect } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
+import { GestureHandlerRootView, GestureDetector, Gesture } from 'react-native-gesture-handler';
+import Animated, {
+  useSharedValue,
+  useAnimatedStyle,
+  withSpring,
+} from 'react-native-reanimated';
+
+const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
+
+const ImageZoomModal = ({ visible, imageUri, onClose }) => {
+  const scale = useSharedValue(1);
+  const savedScale = useSharedValue(1);
+
+  const pinchGesture = Gesture.Pinch()
+    .onUpdate((event) => {
+      scale.value = savedScale.value * event.scale;
+    })
+    .onEnd(() => {
+      scale.value = withSpring(1);
+      savedScale.value = 1;
+    });
+
+  const rStyle = useAnimatedStyle(() => {
+    return {
+      transform: [{ scale: scale.value }],
+    };
+  });
+
+  if (!imageUri) return null;
+
+  return (
+    <Modal visible={visible} transparent animationType="fade">
+      <GestureHandlerRootView style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.9)' }}>
+        <TouchableOpacity
+          style={styles.zoomCloseButton}
+          onPress={onClose}
+        >
+          <Text style={styles.zoomCloseText}>✕ Close</Text>
+        </TouchableOpacity>
+        <GestureDetector gesture={pinchGesture}>
+          <Animated.View style={{ flex: 1, justifyContent: 'center', alignItems: 'center' }}>
+            <Animated.Image
+              source={{ uri: imageUri }}
+              style={[{ width: SCREEN_WIDTH, height: SCREEN_WIDTH, backgroundColor: '#000' }, rStyle]}
+              resizeMode="contain"
+            />
+          </Animated.View>
+        </GestureDetector>
+        <View style={styles.zoomInstruction}>
+          <Text style={styles.zoomInstructionText}>Pinch to zoom in/out</Text>
+        </View>
+      </GestureHandlerRootView>
+    </Modal>
+  );
+};
 
 const UNIT_OPTIONS = ['Unit', 'Box', 'Bundle', 'Reel', 'Length (ft)'];
 
@@ -97,6 +152,11 @@ const getMaterialFamilyKey = (material) => {
 };
 
 const getSharedFamilyImageUri = (variants) => {
+  // Priority 1: Explicit group cover designated by the manager
+  const coverOwner = (variants || []).find((v) => Boolean(v?.groupCoverUri));
+  if (coverOwner?.groupCoverUri) return coverOwner.groupCoverUri;
+
+  // Priority 2: Fallback to the first variant image if no explicit cover is set
   const imageOwner = (variants || []).find((variant) => Boolean(variant?.imageUri));
   return imageOwner?.imageUri || '';
 };
@@ -115,8 +175,9 @@ const buildCatalogDisplayItems = (items) => {
     const firstVariant = sortedVariants[0] || {};
     const hasColorVariants = sortedVariants.some((variant) => isConductorColorFamily(variant)) && sortedVariants.length > 1;
     const hasSizeVariants = sortedVariants.some((variant) => variant?.size && variant.size !== 'N/A') && sortedVariants.length > 1;
+    const isExplicitFamily = Boolean(firstVariant.familyName) && sortedVariants.length > 1;
 
-    if (!hasColorVariants && !hasSizeVariants) {
+    if (!hasColorVariants && !hasSizeVariants && !isExplicitFamily) {
       return {
         ...firstVariant,
         variants: sortedVariants,
@@ -143,15 +204,20 @@ const buildCatalogDisplayItems = (items) => {
 
 const getDefaultAllowedUnitsByCategory = (category) => {
   switch ((category || '').toLowerCase()) {
-    case 'conductors': return ['Unit', 'Reel', 'Length (ft)'];
-    case 'conduits': return ['Unit', 'Bundle'];
-    case 'devices': return ['Unit', 'Box'];
-    case 'tools': return ['Unit', 'Box'];
+    case 'conductors':
+      return ['Unit', 'Reel', 'Length (ft)', 'Length (in)', 'Bottle'];
+    case 'conduits':
+      return ['Unit', 'Bundle', 'Length (ft)', 'Length (in)', 'Bottle'];
+    case 'devices':
+      return ['Unit', 'Box', 'Bottle'];
+    case 'tools':
+      return ['Unit', 'Box', 'Bottle'];
     case 'boxes':
     case 'connectors':
     case 'fittings':
     case 'others':
-    default: return ['Unit', 'Box', 'Bundle'];
+    default:
+      return ['Unit', 'Box', 'Bundle', 'Bottle'];
   }
 };
 
@@ -207,6 +273,7 @@ const familyMatchesQuickFilter = (item, filterId) => {
 
 export default function CatalogManagerScreen({ navigation, currentUser }) {
   const [categories, setCategories] = useState([]);
+  const [unitOptions, setUnitOptions] = useState(['Unit', 'Box', 'Bundle', 'Reel', 'Length (ft)', 'Length (in)', 'Bottle']);
   const [catalog, setCatalog] = useState([]);
   const [filtered, setFiltered] = useState([]);
   const [search, setSearch] = useState('');
@@ -226,6 +293,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   const [editCategory, setEditCategory] = useState('Others');
   const [editDescription, setEditDescription] = useState('');
   const [editForceShowDescription, setEditForceShowDescription] = useState(false);
+  const [groupCoverImageUri, setGroupCoverImageUri] = useState('');
   const [editImageUri, setEditImageUri] = useState('');
   const [allowedUnits, setAllowedUnits] = useState(['Unit', 'Bundle']);
   const [variantDrafts, setVariantDrafts] = useState([]);
@@ -235,7 +303,21 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   const [activeVariantSize, setActiveVariantSize] = useState('');
   const [activeVariantDescription, setActiveVariantDescription] = useState('');
   const [activeVariantForceShowDescription, setActiveVariantForceShowDescription] = useState(false);
+  const [activeVariantImageUri, setActiveVariantImageUri] = useState('');
+  const [isChangingFamily, setIsChangingFamily] = useState(false);
+  const [showGroupCoverPicker, setShowGroupCoverPicker] = useState(false);
+  const [showIndividualImagePicker, setShowIndividualImagePicker] = useState(false);
   const [hardDeleteConfirmed, setHardDeleteConfirmed] = useState(false);
+
+  const [isMultiSelectMode, setIsMultiSelectMode] = useState(false);
+  const [selectedItems, setSelectedItems] = useState([]);
+  const [groupModalVisible, setGroupModalVisible] = useState(false);
+  const [targetGroupName, setTargetGroupName] = useState('');
+  const [groupSearchText, setGroupSearchText] = useState('');
+  const [isMovingToNewGroup, setIsMovingToNewGroup] = useState(true);
+
+  const [zoomVisible, setZoomVisible] = useState(false);
+  const [zoomImageUri, setZoomImageUri] = useState('');
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / ITEMS_PER_PAGE));
   const paginatedFamilies = useMemo(() => {
@@ -264,6 +346,12 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     }
   }, [canEditSharedData, navigation]);
 
+  const openZoom = (uri) => {
+    if (!uri) return;
+    setZoomImageUri(uri);
+    setZoomVisible(true);
+  };
+
   const filterCatalog = (data, text, selectedQuickFilter = activeQuickFilter, selectedSortMode = sortMode) => {
     let familyItems = buildCatalogDisplayItems(data).filter((item) => familyMatchesQuickFilter(item, selectedQuickFilter));
 
@@ -289,13 +377,15 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
 
   const loadCatalog = async () => {
     try {
-      const [localData, fetchedCategories] = await Promise.all([
+      const [localData, fetchedCategories, fetchedUnits] = await Promise.all([
         StorageService.loadCatalogCache(),
-        StorageService.loadCategories()
+        StorageService.loadCategories(),
+        StorageService.loadUnitMeasures()
       ]);
       if (localData.length > 0) {
         applyCatalogToScreen(localData);
         setCategories(fetchedCategories);
+        if (fetchedUnits && fetchedUnits.length > 0) setUnitOptions(fetchedUnits);
         setLoading(false);
       }
       const cloudData = await StorageService.syncCatalogFromFirebase();
@@ -351,7 +441,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     };
     const subscription = BackHandler.addEventListener('hardwareBackPress', handleDeviceBack);
     return () => subscription.remove();
-  }, [navigation, modalVisible]));
+  }, [navigation, modalVisible, menuModalVisible]));
 
   const handleSearch = (text) => {
     setSearch(text);
@@ -378,6 +468,20 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     return `data:image/jpeg;base64,${resizedImage.base64}`;
   };
 
+  const pickGroupCoverImage = async () => {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) return Alert.alert('Permission Required', 'Please allow photo library access.');
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsEditing: true, quality: 0.8 });
+    if (!result.canceled && result.assets?.length > 0) setGroupCoverImageUri(await resizeSelectedImage(result.assets[0].uri));
+  };
+
+  const takeGroupCoverPhoto = async () => {
+    const permission = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permission.granted) return Alert.alert('Permission Required', 'Please allow camera access.');
+    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], allowsEditing: true, quality: 0.8 });
+    if (!result.canceled && result.assets?.length > 0) setGroupCoverImageUri(await resizeSelectedImage(result.assets[0].uri));
+  };
+
   const pickImage = async () => {
     const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
     if (!permission.granted) return Alert.alert('Permission Required', 'Please allow photo library access.');
@@ -392,6 +496,65 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     if (!result.canceled && result.assets?.length > 0) setEditImageUri(await resizeSelectedImage(result.assets[0].uri));
   };
 
+  const toggleMultiSelectMode = () => {
+    setIsMultiSelectMode(!isMultiSelectMode);
+    setSelectedItems([]);
+  };
+
+  const toggleItemSelection = (item) => {
+    setSelectedItems((prev) => {
+      const itemId = item.id || item.familyKey;
+      const isSelected = prev.some((s) => (s.id || s.familyKey) === itemId);
+      if (isSelected) {
+        return prev.filter((s) => (s.id || s.familyKey) !== itemId);
+      }
+      return [...prev, item];
+    });
+  };
+
+  const handleApplyGrouping = async () => {
+    const finalGroupName = targetGroupName.trim();
+    if (!finalGroupName) {
+      Alert.alert('Required', 'Please enter a group name or select an existing one.');
+      return;
+    }
+
+    try {
+      setSaving(true);
+
+      // Collect all individual material variants from the selected display items
+      const allVariantsToMove = selectedItems.flatMap(item => item.variants || [item]);
+
+      if (allVariantsToMove.length === 0) return;
+
+      const userLabel = await StorageService.getCurrentAuditUserLabel?.() || 'manager';
+      const now = new Date().toISOString();
+
+      // We update the familyName for all selected variants.
+      const updatedVariants = allVariantsToMove.map(variant => ({
+        ...variant,
+        familyName: finalGroupName,
+        updatedAt: now,
+        updatedBy: userLabel
+      }));
+
+      // Reuse updateMaterialFamily which handles PATCHing multiple materials
+      await StorageService.updateMaterialFamily(updatedVariants);
+
+      setGroupModalVisible(false);
+      setIsMultiSelectMode(false);
+      setSelectedItems([]);
+      setTargetGroupName('');
+      await loadCatalog();
+      Alert.alert('Success', `Moved ${updatedVariants.length} items to group "${finalGroupName}".`);
+    } catch (error) {
+      console.error('Error grouping materials:', error);
+      Alert.alert('Error', 'Could not group the selected materials.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const openEditModal = (item) => {
     const variants = item?.variants?.length ? item.variants : [item];
     const firstVariant = variants[0] || item;
@@ -402,6 +565,16 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     // otherwise use the material's familyName or name.
     const initialFamilyName = item.isFamilyGroup ? item.name : (firstVariant.familyName || firstVariant.name || '');
     setEditName(initialFamilyName);
+    setTargetGroupName(initialFamilyName);
+    setIsChangingFamily(false);
+    setIsMovingToNewGroup(true);
+    setGroupSearchText('');
+
+    // Find if any variant has a designated group cover
+    const coverOwner = variants.find(v => v.groupCoverUri);
+    const coverUri = coverOwner?.groupCoverUri || item.imageUri || '';
+    setGroupCoverImageUri(coverUri);
+    setShowGroupCoverPicker(Boolean(coverUri));
 
     setEditCategory(firstVariant.category || 'Others');
     setEditDescription(firstVariant.description || '');
@@ -410,7 +583,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     setAllowedUnits(Array.isArray(firstVariant.allowedUnits) && firstVariant.allowedUnits.length > 0 ? firstVariant.allowedUnits.map((u) => u === 'Rolls' ? 'Reel' : u) : getDefaultAllowedUnitsByCategory(firstVariant.category));
     setVariantDrafts(variants.map((variant) => ({
       id: variant.id,
-      name: variant.name || firstVariant.name || '',
+      name: variant.name || '',
       size: variant.size && variant.size !== 'N/A' ? variant.size : '',
       description: variant.description || '',
       forceShowDescription: variant.forceShowDescription === true,
@@ -423,12 +596,29 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   const toggleAllowedUnit = (unit) => {
     setAllowedUnits((current) => current.includes(unit) ? current.filter((u) => u !== unit) : [...current, unit]);
   };
+  const pickVariantImage = async () => {
+    const permission = await ImagePicker.requestMediaLibraryPermissionsAsync();
+    if (!permission.granted) return Alert.alert('Permission Required', 'Please allow photo library access.');
+    const result = await ImagePicker.launchImageLibraryAsync({ mediaTypes: ['images'], allowsEditing: true, quality: 0.8 });
+    if (!result.canceled && result.assets?.length > 0) setActiveVariantImageUri(await resizeSelectedImage(result.assets[0].uri));
+  };
+
+  const takeVariantPhoto = async () => {
+    const permission = await ImagePicker.requestCameraPermissionsAsync();
+    if (!permission.granted) return Alert.alert('Permission Required', 'Please allow camera access.');
+    const result = await ImagePicker.launchCameraAsync({ mediaTypes: ['images'], allowsEditing: true, quality: 0.8 });
+    if (!result.canceled && result.assets?.length > 0) setActiveVariantImageUri(await resizeSelectedImage(result.assets[0].uri));
+  };
+
   const openVariantEditor = (draft) => {
     setActiveVariantDraftId(draft.id);
     setActiveVariantName(draft.name || '');
     setActiveVariantSize(draft.size || '');
     setActiveVariantDescription(draft.description || '');
     setActiveVariantForceShowDescription(draft.forceShowDescription === true);
+    const variantImg = draft.imageUri !== undefined ? draft.imageUri : (draft.original?.imageUri || '');
+    setActiveVariantImageUri(variantImg);
+    setShowIndividualImagePicker(Boolean(variantImg));
     setVariantEditorVisible(true);
   };
 
@@ -439,7 +629,8 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
       name: activeVariantName.trim(),
       size: activeVariantSize.trim(),
       description: activeVariantDescription.trim(),
-      forceShowDescription: activeVariantForceShowDescription
+      forceShowDescription: activeVariantForceShowDescription,
+      imageUri: showIndividualImagePicker ? activeVariantImageUri : ''
     } : draft));
     setVariantEditorVisible(false);
   };
@@ -450,16 +641,20 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   };
 
   const deleteSingleVariant = async (variantId) => {
+    if (!isOwner) {
+      Alert.alert('Owner Required', 'Only owners can delete materials from the catalog.');
+      return;
+    }
     const draft = variantDrafts.find((item) => item.id === variantId);
-    Alert.alert('Remove From Family', `Remove ${draft?.size || draft?.name || 'this material'} from this family?`, [
+    Alert.alert('Permanent Delete', `Permanently delete ${draft?.size || draft?.name || 'this material'} from the catalog? This cannot be undone.`, [
       { text: 'Cancel', style: 'cancel' },
       {
-        text: 'Remove',
+        text: 'Delete',
         style: 'destructive',
         onPress: async () => {
           try {
             setSaving(true);
-            await StorageService.softDeleteMaterial(variantId);
+            await StorageService.permanentDeleteMaterial(variantId);
             const remainingDrafts = variantDrafts.filter((item) => item.id !== variantId);
             const remainingVariants = selectedVariants.filter((item) => item.id !== variantId);
             setVariantDrafts(remainingDrafts);
@@ -468,9 +663,10 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
               setModalVisible(false);
             }
             await loadCatalog();
+            StorageService.reclaimDiskSpace?.();
           } catch (error) {
-            console.error('Error removing family variant:', error);
-            Alert.alert('Error', 'Could not remove this material from the family.');
+            console.error('Error deleting family variant:', error);
+            Alert.alert('Error', 'Could not delete this material from the catalog.');
           } finally {
             setSaving(false);
           }
@@ -481,12 +677,6 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
 
   const handleEditNameChange = (newName) => {
     setEditName(newName);
-    // When the family name is edited, we assume the user wants to update
-    // the base name of all materials in this family too.
-    setVariantDrafts((current) => current.map((draft) => ({
-      ...draft,
-      name: newName.trim()
-    })));
   };
 
   const saveEdits = async () => {
@@ -499,18 +689,24 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
       const draftById = new Map(variantDrafts.map((draft) => [draft.id, draft]));
       const variantsToUpdate = selectedVariants.map((variant, index) => {
         const draft = draftById.get(variant.id) || {};
+
+        // Use individual variant image if it exists in draft, otherwise use original
+        const resolvedVariantImageUri = draft.imageUri !== undefined
+          ? draft.imageUri
+          : (variant.imageUri || '');
+
         return {
           ...variant,
-          name: (draft.name || editName).trim(),
+          name: (draft.name || variant.name || editName).trim(),
           familyName: editName.trim(),
           category: editCategory,
           size: (draft.size || '').trim() || 'N/A',
           description: (draft.description || editDescription).trim(),
           forceShowDescription: draft.forceShowDescription !== undefined ? draft.forceShowDescription : editForceShowDescription,
           allowedUnits,
-          // The first visible variant owns the compressed shared image. Other variants
-          // keep metadata only, and the family card displays the shared image.
-          imageUri: index === 0 ? (editImageUri || '') : ''
+          imageUri: resolvedVariantImageUri,
+          // Store the Group Cover URI in all variants only if the picker is enabled
+          groupCoverUri: showGroupCoverPicker ? (groupCoverImageUri || '') : ''
         };
       });
 
@@ -523,6 +719,10 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
 
       setModalVisible(false);
       await loadCatalog();
+
+      // Reclaim disk space if images were changed or removed
+      StorageService.reclaimDiskSpace?.();
+
       Alert.alert('Saved', variantsToUpdate.length > 1 ? 'Catalog family updated.' : 'Catalog material updated.');
     } catch (error) {
       console.error('Error updating catalog family:', error);
@@ -533,49 +733,18 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   };
 
   const handleDelete = async () => {
+    if (!isOwner) {
+      Alert.alert('Owner Required', 'Only owners can delete materials from the catalog.');
+      return;
+    }
     const variants = selectedVariants.length ? selectedVariants : [selectedItem].filter(Boolean);
     if (!variants.length) return;
 
     Alert.alert(
-      selectedItem?.isFamilyGroup ? 'Delete Family' : 'Delete Material',
+      selectedItem?.isFamilyGroup ? 'Permanent Delete Family' : 'Permanent Delete Material',
       selectedItem?.isFamilyGroup
-        ? `This will hide all ${variants.length} size variants for "${editName}".`
-        : `This will hide "${getMaterialDisplayName(variants[0])}".`,
-      [
-        { text: 'Cancel', style: 'cancel' },
-        {
-          text: isOwner ? 'Soft Delete' : 'Delete',
-          style: 'destructive',
-          onPress: async () => {
-            try {
-              setSaving(true);
-              for (const variant of variants) {
-                await StorageService.softDeleteMaterial(variant.id);
-              }
-              setModalVisible(false);
-              await loadCatalog();
-              Alert.alert('Hidden', 'Catalog item has been marked as deleted.');
-            } catch (error) {
-              console.error('Error deleting catalog family:', error);
-              Alert.alert('Error', 'Could not delete this catalog item.');
-            } finally {
-              setSaving(false);
-            }
-          }
-        }
-      ]
-    );
-  };
-
-
-  const handleHardDelete = async () => {
-    if (!isOwner || !hardDeleteConfirmed) return;
-    const variants = selectedVariants.length ? selectedVariants : [selectedItem].filter(Boolean);
-    if (!variants.length) return;
-
-    Alert.alert(
-      'Permanent Delete',
-      `This will permanently delete ${variants.length} record${variants.length === 1 ? '' : 's'} from Firebase. This cannot be undone.`,
+        ? `This will permanently delete all ${variants.length} size variants for "${editName}" from Firebase. This cannot be undone.`
+        : `This will permanently delete "${getMaterialDisplayName(variants[0])}" from Firebase. This cannot be undone.`,
       [
         { text: 'Cancel', style: 'cancel' },
         {
@@ -589,10 +758,11 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
               }
               setModalVisible(false);
               await loadCatalog();
-              Alert.alert('Deleted', 'The selected catalog record was permanently deleted from Firebase.');
+              StorageService.reclaimDiskSpace?.();
+              Alert.alert('Deleted', 'Catalog item has been permanently deleted from Firebase.');
             } catch (error) {
-              console.error('Error hard deleting catalog item:', error);
-              Alert.alert('Error', 'Could not permanently delete this material. Owner role is required.');
+              console.error('Error deleting catalog family:', error);
+              Alert.alert('Error', 'Could not delete this catalog item.');
             } finally {
               setSaving(false);
             }
@@ -623,6 +793,20 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
         <TouchableOpacity style={styles.syncButton} onPress={refreshCatalogFromFirebase} disabled={refreshing}>
           <Text style={styles.syncButtonText}>{refreshing ? 'Syncing...' : 'Sync Now'}</Text>
         </TouchableOpacity>
+      </View>
+
+      <View style={styles.catalogActionRow}>
+        <TouchableOpacity
+          style={[styles.multiSelectButton, isMultiSelectMode && styles.multiSelectButtonActive]}
+          onPress={toggleMultiSelectMode}
+        >
+          <Text style={[styles.multiSelectButtonText, isMultiSelectMode && styles.multiSelectButtonTextActive]}>
+            {isMultiSelectMode ? 'Cancel Selection' : 'Selection Mode'}
+          </Text>
+        </TouchableOpacity>
+        {isMultiSelectMode && (
+          <Text style={styles.selectedCounter}>{selectedItems.length} items selected</Text>
+        )}
       </View>
       <View style={styles.paginationBar}>
         <TouchableOpacity style={[styles.pageButton, currentPage === 1 && styles.pageButtonDisabled]} onPress={() => goToPage(1)} disabled={currentPage === 1}><Text style={styles.pageButtonText}>« First</Text></TouchableOpacity>
@@ -658,19 +842,46 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
           const colorSummary = item?.isFamilyGroup && item.availableColors?.length ? `Colors: ${item.availableColors.length}` : '';
           const detailSummary = sizeSummary || colorSummary || (item.size && item.size !== 'N/A' ? item.size : 'Single item');
 
+          const itemId = item.id || item.familyKey;
+          const isSelected = selectedItems.some((s) => (s.id || s.familyKey) === itemId);
+
           return (
-            <TouchableOpacity style={styles.card} onPress={() => openEditModal(item)}>
-              {item.imageUri ? <Image source={{ uri: item.imageUri }} style={styles.thumbnail} /> : <View style={styles.thumbnailPlaceholder}><Text style={styles.thumbnailPlaceholderText}>No Photo</Text></View>}
+            <TouchableOpacity
+              style={[styles.card, isSelected && styles.cardSelected]}
+              onPress={() => isMultiSelectMode ? toggleItemSelection(item) : openEditModal(item)}
+            >
+              {isMultiSelectMode && (
+                <View style={[styles.checkbox, isSelected && styles.checkboxActive]}>
+                  <Text style={styles.checkboxText}>{isSelected ? '✓' : ''}</Text>
+                </View>
+              )}
+              {item.imageUri ? (
+                <TouchableOpacity onPress={() => openZoom(item.imageUri)}>
+                  <Image source={{ uri: item.imageUri }} style={styles.thumbnail} />
+                </TouchableOpacity>
+              ) : <View style={styles.thumbnailPlaceholder}><Text style={styles.thumbnailPlaceholderText}>No Photo</Text></View>}
               <View style={{ flex: 1 }}>
                 <Text style={styles.itemName}>{displayName}</Text>
                 <Text style={styles.itemCategory}>{item.category}</Text>
                 <Text style={styles.itemUnits}>{detailSummary}</Text>
               </View>
-              <Text style={styles.editIcon}>✏️</Text>
+              {!isMultiSelectMode && <Text style={styles.editIcon}>✏️</Text>}
             </TouchableOpacity>
           );
         }}
       />
+
+      {isMultiSelectMode && (
+        <View style={styles.multiSelectFooter}>
+          <TouchableOpacity
+            style={[styles.groupSelectedButton, selectedItems.length === 0 && styles.groupSelectedButtonDisabled]}
+            onPress={() => setGroupModalVisible(true)}
+            disabled={selectedItems.length === 0}
+          >
+            <Text style={styles.groupSelectedButtonText}>Group Selected Materials ({selectedItems.length})</Text>
+          </TouchableOpacity>
+        </View>
+      )}
 
       <Modal visible={menuModalVisible} transparent animationType="slide">
         <View style={styles.menuModalOverlay}>
@@ -719,26 +930,123 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
               <TouchableOpacity style={styles.closeIconButton} onPress={() => setModalVisible(false)}>
                 <Text style={styles.closeIconText}>✕</Text>
               </TouchableOpacity>
-              <ScrollView showsVerticalScrollIndicator={false}>
+              <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
                 <Text style={styles.modalTitle}>{selectedItem?.isFamilyGroup ? 'EDIT MATERIAL FAMILY' : 'EDIT CATALOG MATERIAL'}</Text>
-                <Text style={styles.modalSubtitle}>{selectedItem?.isFamilyGroup ? 'One photo and description will represent all selected sizes.' : 'Edit this individual catalog item.'}</Text>
+                <Text style={styles.modalSubtitle}>Manage group cover and individual material details.</Text>
 
-                {editImageUri ? <Image source={{ uri: editImageUri }} style={styles.modalImage} resizeMode="contain" /> : <View style={styles.modalImagePlaceholder}><Text style={styles.modalImagePlaceholderText}>No Photo</Text></View>}
-                <View style={styles.imageButtonRow}>
-                  <TouchableOpacity style={styles.imageButton} onPress={pickImage}><Text style={styles.imageButtonText}>📁 Replace</Text></TouchableOpacity>
-                  <TouchableOpacity style={styles.imageButton} onPress={takePhoto}><Text style={styles.imageButtonText}>📷 Camera</Text></TouchableOpacity>
+                <View style={styles.imageEditSection}>
+                  <TouchableOpacity
+                    style={[styles.checkboxRow, showGroupCoverPicker && styles.checkboxRowActive]}
+                    onPress={() => setShowGroupCoverPicker(!showGroupCoverPicker)}
+                  >
+                    <Text style={styles.checkboxBox}>{showGroupCoverPicker ? '☑' : '☐'}</Text>
+                    <Text style={[styles.familyOptionText, showGroupCoverPicker && styles.familyOptionTextActive]}>Enable Group Cover Photo</Text>
+                  </TouchableOpacity>
+
+                  {showGroupCoverPicker && (
+                    <>
+                      <Text style={styles.imageSectionTitle}>GROUP COVER PHOTO</Text>
+                      <Text style={styles.imageSectionSub}>This photo represents the group in the main catalog list.</Text>
+                      {groupCoverImageUri ? (
+                        <TouchableOpacity onPress={() => openZoom(groupCoverImageUri)}>
+                          <Image source={{ uri: groupCoverImageUri }} style={styles.modalImage} resizeMode="contain" />
+                        </TouchableOpacity>
+                      ) : <View style={styles.modalImagePlaceholder}><Text style={styles.modalImagePlaceholderText}>No Group Cover</Text></View>}
+                      <View style={styles.imageButtonRow}>
+                        <TouchableOpacity style={styles.imageButton} onPress={pickGroupCoverImage}><Text style={styles.imageButtonText}>📁 Replace</Text></TouchableOpacity>
+                        <TouchableOpacity style={styles.imageButton} onPress={takeGroupCoverPhoto}><Text style={styles.imageButtonText}>📷 Camera</Text></TouchableOpacity>
+                      </View>
+                      {groupCoverImageUri ? (
+                        <TouchableOpacity style={styles.removeImageButton} onPress={() => setGroupCoverImageUri('')}>
+                          <Text style={styles.removeImageText}>Remove Group Cover</Text>
+                        </TouchableOpacity>
+                      ) : null}
+                    </>
+                  )}
                 </View>
-                {editImageUri ? <TouchableOpacity style={styles.removeImageButton} onPress={() => setEditImageUri('')}><Text style={styles.removeImageText}>Remove Shared Photo</Text></TouchableOpacity> : null}
 
                 <Text style={styles.inputLabel}>Family / Material Name:</Text>
                 <TextInput style={styles.modalInput} value={editName} onChangeText={handleEditNameChange} />
+
+                <TouchableOpacity
+                  style={styles.changeFamilyButton}
+                  onPress={() => setIsChangingFamily(!isChangingFamily)}
+                >
+                  <Text style={styles.changeFamilyButtonText}>
+                    {isChangingFamily ? 'Hide Group Selection' : 'Change Group / Family'}
+                  </Text>
+                </TouchableOpacity>
+
+                {isChangingFamily && (
+                  <View style={styles.changeFamilyPanel}>
+                    <View style={styles.groupTypeContainer}>
+                      <TouchableOpacity
+                        style={[styles.groupTypeButton, isMovingToNewGroup && styles.groupTypeButtonActive]}
+                        onPress={() => setIsMovingToNewGroup(true)}
+                      >
+                        <Text style={[styles.groupTypeButtonText, isMovingToNewGroup && styles.groupTypeButtonTextActive]}>NEW</Text>
+                      </TouchableOpacity>
+                      <TouchableOpacity
+                        style={[styles.groupTypeButton, !isMovingToNewGroup && styles.groupTypeButtonActive]}
+                        onPress={() => setIsMovingToNewGroup(false)}
+                      >
+                        <Text style={[styles.groupTypeButtonText, !isMovingToNewGroup && styles.groupTypeButtonTextActive]}>EXISTING</Text>
+                      </TouchableOpacity>
+                    </View>
+
+                    {isMovingToNewGroup ? (
+                      <TextInput
+                        style={styles.modalInput}
+                        value={targetGroupName}
+                        onChangeText={(text) => {
+                          setTargetGroupName(text);
+                          handleEditNameChange(text);
+                        }}
+                        placeholder="New group name..."
+                        placeholderTextColor="#777"
+                      />
+                    ) : (
+                      <View>
+                        <TextInput
+                          style={styles.modalInput}
+                          value={groupSearchText}
+                          onChangeText={setGroupSearchText}
+                          placeholder="Search group..."
+                          placeholderTextColor="#777"
+                        />
+                        <ScrollView style={{ maxHeight: 150 }} nestedScrollEnabled>
+                          {buildCatalogDisplayItems(catalog)
+                            .filter(item => item.isFamilyGroup && item.name.toLowerCase().includes(groupSearchText.toLowerCase()))
+                            .map(group => (
+                              <TouchableOpacity
+                                key={group.familyKey}
+                                style={[styles.groupOption, editName === group.name && styles.groupOptionActive]}
+                                onPress={() => {
+                                  setTargetGroupName(group.name);
+                                  handleEditNameChange(group.name);
+                                }}
+                              >
+                                <Text style={[styles.groupOptionText, editName === group.name && styles.groupOptionTextActive]}>{group.name}</Text>
+                              </TouchableOpacity>
+                            ))}
+                        </ScrollView>
+                      </View>
+                    )}
+                  </View>
+                )}
 
                 <Text style={styles.inputLabel}>Registered Family Items:</Text>
                 <View style={styles.variantListCard}>
                   {variantDrafts.map((draft) => (
                     <TouchableOpacity key={draft.id} style={styles.variantCardRow} onPress={() => openVariantEditor(draft)}>
+                      {(draft.imageUri || draft.original?.imageUri) ? (
+                        <Image
+                          source={{ uri: draft.imageUri || draft.original.imageUri }}
+                          style={styles.variantThumbnail}
+                        />
+                      ) : null}
                       <View style={{ flex: 1 }}>
-                        <Text style={styles.variantCardTitle}>{draft.name || 'Unnamed Material'}</Text>
+                        <Text style={styles.variantCardTitle}>{draft.name || draft.original?.name || 'Unnamed Material'}</Text>
                         <Text style={styles.variantCardLine}>Size / Variant: {draft.size || 'N/A'}</Text>
                         <Text style={styles.variantCardDescription} numberOfLines={2}>{draft.description || editDescription || 'No description'}</Text>
                       </View>
@@ -762,23 +1070,13 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                 <View style={styles.grid}>{categories.map((c) => <TouchableOpacity key={String(c)} style={[styles.selector, editCategory === c && styles.selectorActive]} onPress={() => { setEditCategory(c); setAllowedUnits(getDefaultAllowedUnitsByCategory(c)); }}><Text style={[styles.selectorText, editCategory === c && styles.selectorTextActive]}>{String(c).toUpperCase()}</Text></TouchableOpacity>)}</View>
 
                 <Text style={styles.inputLabel}>Units this family should show:</Text>
-                <View style={styles.grid}>{UNIT_OPTIONS.map((u) => <TouchableOpacity key={u} style={[styles.selector, allowedUnits.includes(u) && styles.selectorActive]} onPress={() => toggleAllowedUnit(u)}><Text style={[styles.selectorText, allowedUnits.includes(u) && styles.selectorTextActive]}>{u}</Text></TouchableOpacity>)}</View>
+                <View style={styles.grid}>{unitOptions.map((u) => <TouchableOpacity key={u} style={[styles.selector, allowedUnits.includes(u) && styles.selectorActive]} onPress={() => toggleAllowedUnit(u)}><Text style={[styles.selectorText, allowedUnits.includes(u) && styles.selectorTextActive]}>{u}</Text></TouchableOpacity>)}</View>
 
-                <TouchableOpacity style={styles.deleteButton} onPress={handleDelete} disabled={saving}>
-                  <Text style={styles.deleteButtonText}>{selectedItem?.isFamilyGroup ? '🗑 Soft Delete Family' : '🗑 Soft Delete Material'}</Text>
-                </TouchableOpacity>
-
-                {isOwner ? (
-                  <View style={styles.hardDeleteBox}>
-                    <TouchableOpacity style={styles.hardDeleteConfirmRow} onPress={() => setHardDeleteConfirmed((value) => !value)}>
-                      <Text style={styles.hardDeleteCheckbox}>{hardDeleteConfirmed ? '☑' : '☐'}</Text>
-                      <Text style={styles.hardDeleteWarning}>I understand this will permanently delete from Firebase.</Text>
-                    </TouchableOpacity>
-                    <TouchableOpacity style={[styles.hardDeleteButton, !hardDeleteConfirmed && styles.hardDeleteButtonDisabled]} onPress={handleHardDelete} disabled={!hardDeleteConfirmed || saving}>
-                      <Text style={styles.hardDeleteButtonText}>⚠ HARD DELETE FROM FIREBASE</Text>
-                    </TouchableOpacity>
-                  </View>
-                ) : null}
+                {isOwner && (
+                  <TouchableOpacity style={styles.deleteButton} onPress={handleDelete} disabled={saving}>
+                    <Text style={styles.deleteButtonText}>{selectedItem?.isFamilyGroup ? '🗑 Permanently Delete Family' : '🗑 Permanently Delete Material'}</Text>
+                  </TouchableOpacity>
+                )}
 
                 <View style={styles.modalActions}>
                   <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#8892b0' }]} onPress={() => setModalVisible(false)} disabled={saving}><Text style={styles.btnText}>Cancel</Text></TouchableOpacity>
@@ -799,7 +1097,34 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                 <TouchableOpacity style={styles.closeIconButton} onPress={() => setVariantEditorVisible(false)}>
                   <Text style={styles.closeIconText}>✕</Text>
                 </TouchableOpacity>
-                <Text style={styles.modalTitle}>EDIT FAMILY MATERIAL</Text>
+                <Text style={styles.modalTitle}>EDIT MATERIAL DETAILS</Text>
+
+                <TouchableOpacity
+                  style={[styles.checkboxRow, showIndividualImagePicker && styles.checkboxRowActive]}
+                  onPress={() => setShowIndividualImagePicker(!showIndividualImagePicker)}
+                >
+                  <Text style={styles.checkboxBox}>{showIndividualImagePicker ? '☑' : '☐'}</Text>
+                  <Text style={[styles.familyOptionText, showIndividualImagePicker && styles.familyOptionTextActive]}>Enable Individual Photo</Text>
+                </TouchableOpacity>
+
+                {showIndividualImagePicker && (
+                  <>
+                    <Text style={styles.imageSectionTitle}>INDIVIDUAL PHOTO</Text>
+                    <Text style={styles.imageSectionSub}>This photo only shows up when choosing this specific material.</Text>
+
+                    {activeVariantImageUri ? (
+                      <TouchableOpacity onPress={() => openZoom(activeVariantImageUri)}>
+                        <Image source={{ uri: activeVariantImageUri }} style={styles.modalImage} resizeMode="contain" />
+                      </TouchableOpacity>
+                    ) : <View style={styles.modalImagePlaceholder}><Text style={styles.modalImagePlaceholderText}>No Individual Photo</Text></View>}
+                    <View style={styles.imageButtonRow}>
+                      <TouchableOpacity style={styles.imageButton} onPress={pickVariantImage}><Text style={styles.imageButtonText}>📁 Replace</Text></TouchableOpacity>
+                      <TouchableOpacity style={styles.imageButton} onPress={takeVariantPhoto}><Text style={styles.imageButtonText}>📷 Camera</Text></TouchableOpacity>
+                    </View>
+                    {activeVariantImageUri ? <TouchableOpacity style={styles.removeImageButton} onPress={() => setActiveVariantImageUri('')}><Text style={styles.removeImageText}>Remove Photo</Text></TouchableOpacity> : null}
+                  </>
+                )}
+
                 <Text style={styles.inputLabel}>Material Name:</Text>
                 <TextInput style={styles.modalInput} value={activeVariantName} onChangeText={setActiveVariantName} placeholder="Material name" placeholderTextColor="#777" />
                 <Text style={styles.inputLabel}>Size / Variant:</Text>
@@ -819,6 +1144,90 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
           </SafeAreaView>
         </View>
       </Modal>
+
+      <Modal visible={groupModalVisible} transparent animationType="slide">
+        <View style={styles.modalOverlay}>
+          <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
+            <View style={styles.modalContent}>
+              <TouchableOpacity style={styles.closeIconButton} onPress={() => setGroupModalVisible(false)}>
+                <Text style={styles.closeIconText}>✕</Text>
+              </TouchableOpacity>
+              <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+                <Text style={styles.modalTitle}>GROUP MATERIALS</Text>
+                <Text style={styles.modalSubtitle}>Move the {selectedItems.length} selected items to a new or existing group.</Text>
+
+                <View style={styles.groupTypeContainer}>
+                  <TouchableOpacity
+                    style={[styles.groupTypeButton, isMovingToNewGroup && styles.groupTypeButtonActive]}
+                    onPress={() => setIsMovingToNewGroup(true)}
+                  >
+                    <Text style={[styles.groupTypeButtonText, isMovingToNewGroup && styles.groupTypeButtonTextActive]}>NEW GROUP</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.groupTypeButton, !isMovingToNewGroup && styles.groupTypeButtonActive]}
+                    onPress={() => setIsMovingToNewGroup(false)}
+                  >
+                    <Text style={[styles.groupTypeButtonText, !isMovingToNewGroup && styles.groupTypeButtonTextActive]}>EXISTING GROUP</Text>
+                  </TouchableOpacity>
+                </View>
+
+                {isMovingToNewGroup ? (
+                  <View style={{ marginTop: 10 }}>
+                    <Text style={styles.inputLabel}>New Group Name:</Text>
+                    <TextInput
+                      style={styles.modalInput}
+                      value={targetGroupName}
+                      onChangeText={setTargetGroupName}
+                      placeholder="e.g.: Drill Bit, EMT Pipe, UTP Cable"
+                      placeholderTextColor="#777"
+                    />
+                  </View>
+                ) : (
+                  <View style={{ marginTop: 10 }}>
+                    <Text style={styles.inputLabel}>Search Existing Group:</Text>
+                    <TextInput
+                      style={styles.modalInput}
+                      value={groupSearchText}
+                      onChangeText={setGroupSearchText}
+                      placeholder="Search group name..."
+                      placeholderTextColor="#777"
+                    />
+                    <ScrollView style={{ maxHeight: 200 }} nestedScrollEnabled>
+                      {buildCatalogDisplayItems(catalog)
+                        .filter(item => item.isFamilyGroup && item.name.toLowerCase().includes(groupSearchText.toLowerCase()))
+                        .map(group => (
+                          <TouchableOpacity
+                            key={group.familyKey}
+                            style={[styles.groupOption, targetGroupName === group.name && styles.groupOptionActive]}
+                            onPress={() => setTargetGroupName(group.name)}
+                          >
+                            <Text style={[styles.groupOptionText, targetGroupName === group.name && styles.groupOptionTextActive]}>{group.name}</Text>
+                            <Text style={styles.groupOptionSubText}>{group.category} • {group.variants.length} items</Text>
+                          </TouchableOpacity>
+                        ))}
+                    </ScrollView>
+                  </View>
+                )}
+
+                <View style={styles.modalActions}>
+                  <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#8892b0' }]} onPress={() => setGroupModalVisible(false)} disabled={saving}>
+                    <Text style={styles.btnText}>Cancel</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#0275d8' }]} onPress={handleApplyGrouping} disabled={saving}>
+                    {saving ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnText}>Apply Grouping</Text>}
+                  </TouchableOpacity>
+                </View>
+              </ScrollView>
+            </View>
+          </SafeAreaView>
+        </View>
+      </Modal>
+
+      <ImageZoomModal
+        visible={zoomVisible}
+        imageUri={zoomImageUri}
+        onClose={() => setZoomVisible(false)}
+      />
     </SafeAreaView>
   );
 }
@@ -954,4 +1363,242 @@ const styles = StyleSheet.create({
   pageButtonText: { color: '#64ffda', fontWeight: '700', fontSize: 12 },
   pageInfo: { color: '#ccd6f6', fontWeight: '700', fontSize: 12, paddingHorizontal: 4 },
 
+  catalogActionRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    paddingHorizontal: 14,
+    marginBottom: 10
+  },
+  multiSelectButton: {
+    backgroundColor: '#112240',
+    borderWidth: 1,
+    borderColor: '#233554',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+    borderRadius: 8
+  },
+  multiSelectButtonActive: {
+    borderColor: '#64ffda',
+    backgroundColor: '#0d2b4f'
+  },
+  multiSelectButtonText: {
+    color: '#ccd6f6',
+    fontSize: 12,
+    fontWeight: 'bold'
+  },
+  multiSelectButtonTextActive: {
+    color: '#64ffda'
+  },
+  selectedCounter: {
+    color: '#64ffda',
+    fontWeight: 'bold',
+    fontSize: 12
+  },
+  cardSelected: {
+    borderColor: '#64ffda',
+    borderWidth: 1,
+    backgroundColor: '#17345a'
+  },
+  checkbox: {
+    width: 24,
+    height: 24,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#64ffda',
+    marginRight: 10,
+    justifyContent: 'center',
+    alignItems: 'center'
+  },
+  checkboxActive: {
+    backgroundColor: '#0275d8',
+    borderColor: '#64ffda'
+  },
+  checkboxText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    fontSize: 14
+  },
+  multiSelectFooter: {
+    position: 'absolute',
+    left: 15,
+    right: 15,
+    bottom: 20,
+    backgroundColor: 'transparent'
+  },
+  groupSelectedButton: {
+    backgroundColor: '#0275d8',
+    padding: 15,
+    borderRadius: 10,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#64ffda',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 4,
+    elevation: 5
+  },
+  groupSelectedButtonDisabled: {
+    backgroundColor: '#233554',
+    borderColor: '#33445f'
+  },
+  groupSelectedButtonText: {
+    color: '#fff',
+    fontWeight: 'bold',
+    textTransform: 'uppercase'
+  },
+  groupTypeContainer: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 10,
+    gap: 10
+  },
+  groupTypeButton: {
+    flex: 1,
+    backgroundColor: '#e2e8f0',
+    padding: 10,
+    borderRadius: 8,
+    alignItems: 'center',
+    borderWidth: 1,
+    borderColor: '#cbd5e1'
+  },
+  groupTypeButtonActive: {
+    backgroundColor: '#0275d8',
+    borderColor: '#0275d8'
+  },
+  groupTypeButtonText: {
+    color: '#475569',
+    fontWeight: 'bold',
+    fontSize: 12
+  },
+  groupTypeButtonTextActive: {
+    color: '#fff'
+  },
+  groupOption: {
+    backgroundColor: '#fff',
+    padding: 12,
+    borderRadius: 8,
+    marginBottom: 6,
+    borderWidth: 1,
+    borderColor: '#cbd5e1'
+  },
+  groupOptionActive: {
+    borderColor: '#0275d8',
+    backgroundColor: '#eff6ff'
+  },
+  groupOptionText: {
+    color: '#0a192f',
+    fontWeight: 'bold',
+    fontSize: 14
+  },
+  groupOptionTextActive: {
+    color: '#0275d8'
+  },
+  groupOptionSubText: {
+    color: '#64748b',
+    fontSize: 11,
+    marginTop: 2
+  },
+  changeFamilyButton: {
+    backgroundColor: '#f1f5f9',
+    padding: 8,
+    borderRadius: 6,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    alignSelf: 'flex-start',
+    marginTop: 5,
+    marginBottom: 10
+  },
+  changeFamilyButtonText: {
+    color: '#475569',
+    fontSize: 11,
+    fontWeight: 'bold'
+  },
+  changeFamilyPanel: {
+    backgroundColor: '#e2e8f0',
+    padding: 10,
+    borderRadius: 10,
+    marginBottom: 15,
+    borderWidth: 1,
+    borderColor: '#cbd5e1'
+  },
+  zoomCloseButton: {
+    position: 'absolute',
+    top: 50,
+    right: 20,
+    zIndex: 100,
+    backgroundColor: 'rgba(0,0,0,0.5)',
+    padding: 10,
+    borderRadius: 8
+  },
+  zoomCloseText: {
+    color: '#fff',
+    fontWeight: 'bold'
+  },
+  zoomInstruction: {
+    position: 'absolute',
+    bottom: 50,
+    width: '100%',
+    alignItems: 'center'
+  },
+  zoomInstructionText: {
+    color: 'rgba(255,255,255,0.7)',
+    fontSize: 12
+  },
+  variantThumbnail: {
+    width: 40,
+    height: 40,
+    borderRadius: 6,
+    marginRight: 10,
+    backgroundColor: '#fff'
+  },
+  imageEditSection: {
+    backgroundColor: '#fff',
+    padding: 15,
+    borderRadius: 12,
+    marginBottom: 20,
+    borderWidth: 1,
+    borderColor: '#cbd5e1'
+  },
+  imageSectionTitle: {
+    color: '#075bc7',
+    fontSize: 12,
+    fontWeight: '900',
+    textAlign: 'center'
+  },
+  imageSectionSub: {
+    color: '#64748b',
+    fontSize: 10,
+    textAlign: 'center',
+    marginBottom: 10
+  },
+  checkboxRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    backgroundColor: '#fff',
+    borderRadius: 8,
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    padding: 10,
+    marginBottom: 8
+  },
+  checkboxRowActive: {
+    backgroundColor: '#eff6ff',
+    borderColor: '#0275d8'
+  },
+  checkboxBox: {
+    color: '#0275d8',
+    fontSize: 18,
+    fontWeight: '900'
+  },
+  familyOptionText: {
+    color: '#0a192f',
+    fontWeight: '800',
+    fontSize: 13
+  },
+  familyOptionTextActive: {
+    color: '#0275d8'
+  }
 });
