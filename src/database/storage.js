@@ -11,7 +11,8 @@
  */
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as SQLite from 'expo-sqlite';
-import * as FileSystem from 'expo-file-system';
+import * as FileSystem from 'expo-file-system/legacy';
+import * as ImageManipulator from 'expo-image-manipulator';
 import { initialCatalog } from './catalogData';
 import { FIREBASE_CONFIG } from './firebaseConfig';
 import { AuthService } from './authService';
@@ -72,11 +73,17 @@ const MATERIALS_ENDPOINT = `${FIREBASE_DATABASE_URL}/materials.json`;
 const CATEGORIES_ENDPOINT = `${FIREBASE_DATABASE_URL}/categories.json`;
 const UNIT_MEASURES_ENDPOINT = `${FIREBASE_DATABASE_URL}/unitMeasures.json`;
 const IMPORTANT_INFO_ENDPOINT = `${FIREBASE_DATABASE_URL}/importantInfo.json`;
+const CATALOG_META_ENDPOINT = `${FIREBASE_DATABASE_URL}/meta/catalog.json`;
+const CATALOG_STORAGE_FOLDER = 'catalog-thumbnails';
+// Important Info keeps full-quality reference photos. The catalog only stores
+// tiny visual thumbnails so Firebase downloads stay low on the Spark plan.
+const IMPORTANT_INFO_STORAGE_FOLDER = 'important-info-images';
 const CATEGORIES_CACHE_KEY = '@material_categories_cache_v1';
 const UNIT_MEASURES_CACHE_KEY = '@material_unit_measures_cache_v1';
 const IMPORTANT_INFO_CACHE_KEY = '@important_info_cache_v1';
 const CATALOG_CACHE_SCHEMA_KEY = '@material_catalog_cache_schema_version';
-const CATALOG_CACHE_SCHEMA_VERSION = 'no-full-json-cache-v1';
+const CATALOG_CACHE_SCHEMA_VERSION = 'storage-url-thumbnail-lazy-cache-v3';
+const CATALOG_CLOUD_UPDATED_AT_KEY = '@material_catalog_cloud_updated_at_v1';
 
 // Default catalog categories and unit measures. These are kept locally so the
 // app always works offline, and owner accounts can also seed them into Firebase
@@ -248,6 +255,280 @@ const ensureDirectoryExists = async (directoryUri) => {
   return true;
 };
 
+
+const createStorageFileName = ({ folder, fileKey, extension = 'jpg' }) => {
+  const safeKey = sanitizeImageFileName(fileKey || `image-${Date.now()}`);
+  return `${folder}/${safeKey}-${Date.now()}.${extension}`;
+};
+
+/**
+ * Uploads an image data URI to Firebase Storage and returns a small metadata object.
+ * Realtime Database receives only the download URL and storage path, not the base64 image.
+ * This keeps Realtime Database downloads low and prevents SQLite/AsyncStorage from filling up.
+ */
+const getBase64PayloadFromDataUri = (dataUri) => String(dataUri || '').split('base64,')[1] || '';
+
+const getContentTypeFromDataUri = (dataUri) => {
+  const mimeMatch = String(dataUri || '').match(/^data:(image\/(?:png|jpeg|jpg|webp));base64,/i);
+  if (!mimeMatch) return 'image/jpeg';
+  return mimeMatch[1].replace('image/jpg', 'image/jpeg').toLowerCase();
+};
+
+
+const extractFirebaseStoragePathFromUrl = (value) => {
+  const text = String(value || '');
+  if (!text.includes('firebasestorage.googleapis.com')) return '';
+  const match = text.match(/\/o\/([^?]+)/);
+  if (!match?.[1]) return '';
+  try {
+    return decodeURIComponent(match[1]);
+  } catch (error) {
+    return match[1];
+  }
+};
+
+const resolveStoragePath = (storagePath, imageUri) => storagePath || extractFirebaseStoragePathFromUrl(imageUri);
+
+const createFirebaseStorageDownloadUrl = (storagePath) => {
+  const bucket = FIREBASE_CONFIG.storageBucket;
+  const encodedPath = encodeURIComponent(storagePath);
+  return `https://firebasestorage.googleapis.com/v0/b/${bucket}/o/${encodedPath}?alt=media`;
+};
+
+/**
+ * Uploads a data URI to Firebase Storage using Expo FileSystem native upload.
+ * Important: do not use Firebase Storage SDK uploadString/uploadBytes here on
+ * Android Expo, because those paths can still create ArrayBuffer/Blob objects
+ * internally and trigger: "Creating blobs from ArrayBuffer are not supported".
+ */
+const uploadDataUriToFirebaseStorage = async ({ dataUri, folder, fileKey }) => {
+  if (!isInlineImageDataUri(dataUri)) {
+    return { imageUri: dataUri || '', storagePath: '' };
+  }
+
+  const idToken = await AuthService.getCurrentIdToken();
+  if (!idToken) throw new Error('Firebase Storage upload requires a signed-in user.');
+
+  const extension = getImageExtensionFromDataUri(dataUri);
+  const storagePath = createStorageFileName({ folder, fileKey, extension });
+  const contentType = getContentTypeFromDataUri(dataUri);
+  const temporaryFileUri = await writeDataUriToTemporaryFile({ dataUri, fileKey: `${fileKey}-upload` });
+
+  const uploadUrl = `https://firebasestorage.googleapis.com/v0/b/${FIREBASE_CONFIG.storageBucket}/o?uploadType=media&name=${encodeURIComponent(storagePath)}`;
+
+  const response = await FileSystem.uploadAsync(uploadUrl, temporaryFileUri, {
+    httpMethod: 'POST',
+    // Use the legacy FileSystem API because uploadAsync was moved out of the main
+    // expo-file-system export in newer Expo versions.
+    uploadType: FileSystem.FileSystemUploadType.BINARY_CONTENT,
+    headers: {
+      Authorization: `Bearer ${idToken}`,
+      'Content-Type': contentType,
+      'Cache-Control': 'public,max-age=31536000'
+    }
+  });
+
+  if (response.status < 200 || response.status >= 300) {
+    throw new Error(`Firebase Storage upload failed (${response.status}): ${response.body || 'No response body'}`);
+  }
+
+  try {
+    await FileSystem.deleteAsync(temporaryFileUri, { idempotent: true });
+  } catch (error) {
+    console.warn('StorageService Warning (temporary upload file cleanup skipped):', error);
+  }
+
+  return { imageUri: createFirebaseStorageDownloadUrl(storagePath), storagePath };
+};
+
+const deleteFirebaseStorageFileIfPossible = async (storagePath) => {
+  if (!storagePath) return;
+
+  try {
+    const idToken = await AuthService.getCurrentIdToken();
+    if (!idToken) {
+      console.warn('StorageService Warning (delete storage image skipped): signed-in Firebase user token was not available.');
+      return;
+    }
+
+    const deleteUrl = `https://firebasestorage.googleapis.com/v0/b/${FIREBASE_CONFIG.storageBucket}/o/${encodeURIComponent(storagePath)}`;
+    const response = await fetch(deleteUrl, {
+      method: 'DELETE',
+      headers: {
+        Authorization: `Bearer ${idToken}`
+      }
+    });
+
+    // 404 means the old image is already gone. That should not block editing.
+    if (response.status === 404) return;
+
+    if (!response.ok) {
+      const responseText = await response.text().catch(() => '');
+      throw new Error(`Firebase Storage delete failed (${response.status}): ${responseText || 'No response body'}`);
+    }
+  } catch (error) {
+    // Missing/locked images should never break catalog editing. The warning helps
+    // owner/admin clean up any leftover Storage file later if needed.
+    console.warn('StorageService Warning (delete storage image skipped):', error);
+  }
+};
+
+const downloadRemoteImageToLocalCache = async ({ imageUri, fileKey, directoryUri }) => {
+  if (!imageUri || !String(imageUri).startsWith('http')) return imageUri || '';
+  if (!FileSystem.documentDirectory) return imageUri;
+
+  try {
+    await ensureDirectoryExists(LOCAL_IMAGE_CACHE_ROOT);
+    await ensureDirectoryExists(directoryUri);
+    const safeFileName = `${sanitizeImageFileName(fileKey)}.jpg`;
+    const localUri = `${directoryUri}${safeFileName}`;
+    const existing = await FileSystem.getInfoAsync(localUri);
+    if (existing.exists && Number(existing.size || 0) > 0) return localUri;
+    await FileSystem.downloadAsync(imageUri, localUri);
+    return localUri;
+  } catch (error) {
+    console.warn('Image cache warning: could not download remote image to local cache.', error);
+    return imageUri;
+  }
+};
+
+const writeDataUriToTemporaryFile = async ({ dataUri, fileKey }) => {
+  if (!isInlineImageDataUri(dataUri) || !FileSystem.cacheDirectory) return dataUri || '';
+
+  const extension = getImageExtensionFromDataUri(dataUri);
+  const base64Payload = getBase64PayloadFromDataUri(dataUri);
+  const temporaryUri = `${FileSystem.cacheDirectory}${sanitizeImageFileName(fileKey)}-${Date.now()}.${extension}`;
+
+  await FileSystem.writeAsStringAsync(temporaryUri, base64Payload, {
+    encoding: FileSystem.EncodingType.Base64
+  });
+
+  return temporaryUri;
+};
+
+const createCatalogThumbnailDataUri = async ({ imageUri, fileKey }) => {
+  if (!imageUri) return '';
+
+  let localSourceUri = imageUri;
+
+  if (isInlineImageDataUri(imageUri)) {
+    localSourceUri = await writeDataUriToTemporaryFile({ dataUri: imageUri, fileKey });
+  } else if (String(imageUri).startsWith('http')) {
+    localSourceUri = await downloadRemoteImageToLocalCache({
+      imageUri,
+      fileKey: `${fileKey}-source`,
+      directoryUri: CATALOG_IMAGE_CACHE_DIR
+    });
+  }
+
+  const thumbnail = await ImageManipulator.manipulateAsync(
+    localSourceUri,
+    [{ resize: { width: 180 } }],
+    { compress: 0.28, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+  );
+
+  return `data:image/jpeg;base64,${thumbnail.base64}`;
+};
+
+const uploadCatalogImageAsThumbnail = async ({ imageUri, folder, fileKey }) => {
+  if (!imageUri) return { imageUri: '', storagePath: '' };
+  if (String(imageUri).startsWith('https://firebasestorage.googleapis.com') && String(imageUri).includes(CATALOG_STORAGE_FOLDER)) {
+    return { imageUri, storagePath: extractFirebaseStoragePathFromUrl(imageUri) };
+  }
+
+  const thumbnailDataUri = await createCatalogThumbnailDataUri({ imageUri, fileKey });
+  return uploadDataUriToFirebaseStorage({ dataUri: thumbnailDataUri, folder, fileKey });
+};
+
+const saveCatalogImagesToFirebaseStorage = async (material) => {
+  const normalized = normalizeMaterial(material);
+  let imageUri = normalized.imageUri || '';
+  let imageStoragePath = normalized.imageStoragePath || '';
+  let groupCoverUri = normalized.groupCoverUri || '';
+  let groupCoverStoragePath = normalized.groupCoverStoragePath || '';
+
+  if (imageUri && (isInlineImageDataUri(imageUri) || String(imageUri).startsWith('file://') || String(imageUri).startsWith('content://'))) {
+    if (imageStoragePath) await deleteFirebaseStorageFileIfPossible(imageStoragePath);
+    const uploaded = await uploadCatalogImageAsThumbnail({
+      imageUri,
+      folder: CATALOG_STORAGE_FOLDER,
+      fileKey: `${normalized.id}-thumbnail`
+    });
+    imageUri = uploaded.imageUri;
+    imageStoragePath = uploaded.storagePath;
+  }
+
+  if (groupCoverUri && (isInlineImageDataUri(groupCoverUri) || String(groupCoverUri).startsWith('file://') || String(groupCoverUri).startsWith('content://'))) {
+    if (groupCoverStoragePath) await deleteFirebaseStorageFileIfPossible(groupCoverStoragePath);
+    const uploaded = await uploadCatalogImageAsThumbnail({
+      imageUri: groupCoverUri,
+      folder: CATALOG_STORAGE_FOLDER,
+      fileKey: `${normalized.familyName || normalized.id}-cover-thumbnail`
+    });
+    groupCoverUri = uploaded.imageUri;
+    groupCoverStoragePath = uploaded.storagePath;
+  }
+
+  return {
+    ...normalized,
+    imageUri,
+    imageStoragePath,
+    groupCoverUri,
+    groupCoverStoragePath
+  };
+};
+
+const saveImportantInfoImageToFirebaseStorage = async (item) => {
+  const normalized = normalizeImportantInfoItem(item);
+  if (!isInlineImageDataUri(normalized.imageUri)) return normalized;
+
+  if (normalized.imageStoragePath) {
+    await deleteFirebaseStorageFileIfPossible(normalized.imageStoragePath);
+  }
+
+  const uploaded = await uploadDataUriToFirebaseStorage({
+    dataUri: normalized.imageUri,
+    folder: IMPORTANT_INFO_STORAGE_FOLDER,
+    fileKey: `${normalized.id}-full`
+  });
+
+  return {
+    ...normalized,
+    imageUri: uploaded.imageUri,
+    imageStoragePath: uploaded.storagePath
+  };
+};
+
+const getRemoteCatalogUpdatedAt = async () => {
+  try {
+    const response = await fetch(CATALOG_META_ENDPOINT);
+    if (!response.ok) return '';
+    const metadata = await response.json();
+    return metadata?.updatedAt || '';
+  } catch (error) {
+    console.warn('StorageService Warning (catalog metadata fetch skipped):', error);
+    return '';
+  }
+};
+
+const setRemoteCatalogUpdatedAt = async () => {
+  try {
+    const userLabel = await getCurrentAuditUserLabel();
+    const metaUrl = await buildAuthenticatedFirebaseUrl(CATALOG_META_ENDPOINT);
+    const now = new Date().toISOString();
+    const response = await fetch(metaUrl, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updatedAt: now, updatedBy: userLabel })
+    });
+    if (response.ok) await AsyncStorage.setItem(CATALOG_CLOUD_UPDATED_AT_KEY, now);
+    return now;
+  } catch (error) {
+    console.warn('StorageService Warning (catalog metadata update skipped):', error);
+    return '';
+  }
+};
+
 /**
  * Saves a base64 data URI as a local image file and returns the file:// path.
  *
@@ -283,39 +564,52 @@ const saveInlineImageToLocalFile = async ({ dataUri, fileKey, directoryUri }) =>
 const prepareMaterialForLocalCache = async (material) => {
   const normalized = normalizeMaterial(material);
 
-  if (!isInlineImageDataUri(normalized.imageUri)) {
-    return normalized;
+  if (isInlineImageDataUri(normalized.imageUri)) {
+    const localImageUri = await saveInlineImageToLocalFile({
+      dataUri: normalized.imageUri,
+      fileKey: `${normalized.id}-${normalized.updatedAt || 'image'}`,
+      directoryUri: CATALOG_IMAGE_CACHE_DIR
+    });
+
+    return {
+      ...normalized,
+      imageUri: localImageUri
+    };
   }
 
-  const localImageUri = await saveInlineImageToLocalFile({
-    dataUri: normalized.imageUri,
-    fileKey: `${normalized.id}-${normalized.updatedAt || 'image'}`,
-    directoryUri: CATALOG_IMAGE_CACHE_DIR
-  });
-
-  return {
-    ...normalized,
-    imageUri: localImageUri
-  };
+  // Important optimization: do NOT download remote catalog images during sync.
+  // Sync must only cache metadata. Images are downloaded lazily by CachedCatalogImage
+  // only when the material is actually visible on screen. This prevents a single
+  // catalog refresh from consuming hundreds of MB of Firebase bandwidth.
+  return normalized;
 };
 
 const prepareImportantInfoForLocalCache = async (item) => {
   const normalized = normalizeImportantInfoItem(item);
 
-  if (!isInlineImageDataUri(normalized.imageUri)) {
-    return normalized;
+  if (isInlineImageDataUri(normalized.imageUri)) {
+    const localImageUri = await saveInlineImageToLocalFile({
+      dataUri: normalized.imageUri,
+      fileKey: `${normalized.id}-${normalized.updatedAt || 'image'}`,
+      directoryUri: IMPORTANT_INFO_IMAGE_CACHE_DIR
+    });
+
+    return {
+      ...normalized,
+      imageUri: localImageUri
+    };
   }
 
-  const localImageUri = await saveInlineImageToLocalFile({
-    dataUri: normalized.imageUri,
-    fileKey: `${normalized.id}-${normalized.updatedAt || 'image'}`,
-    directoryUri: IMPORTANT_INFO_IMAGE_CACHE_DIR
-  });
+  if (String(normalized.imageUri || '').startsWith('http')) {
+    const localImageUri = await downloadRemoteImageToLocalCache({
+      imageUri: normalized.imageUri,
+      fileKey: `${normalized.id}-${normalized.updatedAt || 'image'}`,
+      directoryUri: IMPORTANT_INFO_IMAGE_CACHE_DIR
+    });
+    return { ...normalized, imageUri: localImageUri };
+  }
 
-  return {
-    ...normalized,
-    imageUri: localImageUri
-  };
+  return normalized;
 };
 
 const normalizeMaterial = (material) => {
@@ -340,9 +634,16 @@ const normalizeMaterial = (material) => {
     category: material.category === 'Other' ? 'Others' : (material.category || 'Others'),
     size: normalizedLegacyFields.size || 'N/A',
     imageUri: material.imageUri || '',
+    imageStoragePath: material.imageStoragePath || '',
     groupCoverUri: material.groupCoverUri || '',
+    groupCoverStoragePath: material.groupCoverStoragePath || '',
+    groupDescription: material.groupDescription || '',
     description: material.description || '',
     forceShowDescription: material.forceShowDescription === true,
+    // Family-level UI preference used by CatalogScreen when opening a family
+    // from Add Material to Quantity Sheet. Keep only the supported values so
+    // older records safely default to square buttons.
+    familyDisplayMode: material.familyDisplayMode === 'list' ? 'list' : 'grid',
     keywords: buildAutomaticKeywords(material, normalizedLegacyFields),
     allowedUnits: normalizeAllowedUnits(material.allowedUnits, material.category),
     createdAt: material.createdAt || new Date().toISOString(),
@@ -437,6 +738,7 @@ const normalizeImportantInfoItem = (item) => ({
   title: item.title || 'Untitled Info',
   body: item.body || '',
   imageUri: item.imageUri || '',
+  imageStoragePath: item.imageStoragePath || '',
   createdAt: item.createdAt || new Date().toISOString(),
   updatedAt: item.updatedAt || new Date().toISOString(),
   createdBy: item.createdBy || FALLBACK_USER_LABEL,
@@ -516,11 +818,11 @@ const getSQLiteDatabase = async () => {
   return database;
 };
 
-// Catalog photos can be very large base64 data URIs. SQLite should not store
-// those images directly. The local cache keeps only one image reference per
-// material family and writes inline Firebase images to the device file system.
-// Every repeated size still appears in the catalog, but only one family image
-// is cached locally. This keeps the app fast and prevents SQLITE_FULL.
+// Catalog photos can be very large. SQLite should not store those images
+// directly. The local cache keeps only one lightweight image reference per
+// material family. Remote images are not downloaded here; they are downloaded
+// lazily by the UI only when the row becomes visible. This keeps Firebase usage
+// low and prevents SQLITE_FULL/CursorWindow errors.
 const getMaterialFamilyKeyForCache = (material) => `${String(material?.category || 'Others').toLowerCase()}::${getSortableBaseName(material)}`;
 
 const createFamilySharedImageCatalogCache = async (catalog) => {
@@ -560,7 +862,9 @@ const createCatalogCacheRecord = (material) => {
   return {
     ...normalized,
     imageUri: isLocalFileOrRemoteImageReference(normalized.imageUri) ? normalized.imageUri : '',
-    groupCoverUri: isLocalFileOrRemoteImageReference(normalized.groupCoverUri) ? normalized.groupCoverUri : ''
+    imageStoragePath: normalized.imageStoragePath || '',
+    groupCoverUri: isLocalFileOrRemoteImageReference(normalized.groupCoverUri) ? normalized.groupCoverUri : '',
+    groupCoverStoragePath: normalized.groupCoverStoragePath || ''
   };
 };
 
@@ -689,7 +993,48 @@ const removeImportantInfoRowFromSQLite = async (itemId) => {
   });
 };
 
+
+const getCatalogImageLocalCacheUri = async ({ imageUri, materialId, updatedAt }) => {
+  return downloadRemoteImageToLocalCache({
+    imageUri,
+    fileKey: `${materialId || 'catalog-image'}-${updatedAt || 'image'}`,
+    directoryUri: CATALOG_IMAGE_CACHE_DIR
+  });
+};
+
+const clearDirectoryIfPossible = async (directoryUri) => {
+  try {
+    const info = await FileSystem.getInfoAsync(directoryUri);
+    if (info.exists) await FileSystem.deleteAsync(directoryUri, { idempotent: true });
+    await ensureDirectoryExists(directoryUri);
+  } catch (error) {
+    console.warn('StorageService Warning (clear image cache skipped):', error);
+  }
+};
+
 export const StorageService = {
+  /**
+   * Lazily resolves a catalog thumbnail into a local file URI. Use this only
+   * from visible UI rows. It avoids downloading every image during catalog sync.
+   */
+  async getCatalogThumbnailForDisplay(material) {
+    const normalized = normalizeMaterial(material || {});
+    return getCatalogImageLocalCacheUri({
+      imageUri: normalized.imageUri || normalized.groupCoverUri || '',
+      materialId: normalized.id,
+      updatedAt: normalized.updatedAt
+    });
+  },
+
+  /**
+   * Owner/debug maintenance helper. Clears only local thumbnail cache; Firebase
+   * images remain safe. Useful after replacing many catalog images.
+   */
+  async clearLocalCatalogImageCache() {
+    await clearDirectoryIfPossible(CATALOG_IMAGE_CACHE_DIR);
+    return true;
+  },
+
   /**
    * Saves project draft locally. The requisition stays local and independent from catalog images.
    */
@@ -824,10 +1169,11 @@ export const StorageService = {
     const cachedCatalog = await this.loadCatalogCache();
 
     if (cachedCatalog.length > 0) {
-      // Do not block the UI. The screen receives cached data immediately while
-      // Firebase updates SQLite in the background for the next refresh.
-      this.syncCatalogFromFirebase().catch((error) => {
-        console.error('StorageService Background Catalog Sync Error:', error);
+      // Only check a tiny metadata node on open/focus. If the cloud timestamp
+      // has not changed, the app stays fully local and does not re-download the
+      // full catalog or image URLs.
+      this.syncCatalogIfChanged().catch((error) => {
+        console.error('StorageService Background Catalog Metadata Sync Error:', error);
       });
       return cachedCatalog;
     }
@@ -842,6 +1188,95 @@ export const StorageService = {
     }
   },
 
+  async syncCatalogIfChanged() {
+    const remoteUpdatedAt = await getRemoteCatalogUpdatedAt();
+    const localUpdatedAt = await AsyncStorage.getItem(CATALOG_CLOUD_UPDATED_AT_KEY);
+
+    if (remoteUpdatedAt && localUpdatedAt && remoteUpdatedAt === localUpdatedAt) {
+      return await this.loadCatalogCache();
+    }
+
+    const catalog = await this.syncCatalogFromFirebase();
+    if (remoteUpdatedAt) await AsyncStorage.setItem(CATALOG_CLOUD_UPDATED_AT_KEY, remoteUpdatedAt);
+    return catalog;
+  },
+
+
+  /**
+   * One-time owner maintenance tool. It converts old base64 catalog images that
+   * are still stored inside Realtime Database into Firebase Storage thumbnails.
+   * Run this after upgrading so future catalog reads download tiny JSON records
+   * instead of large embedded images.
+   */
+  async migrateCatalogInlineImagesToStorageThumbnails() {
+    await ensureSharedDataEditor();
+    const catalog = await this.syncCatalogFromFirebase();
+    const firebasePatch = {};
+    let migratedCount = 0;
+
+    for (const material of catalog) {
+      const normalized = normalizeMaterial(material);
+      const needsImageOptimization = Boolean(
+        normalized.imageUri && (
+          isInlineImageDataUri(normalized.imageUri) ||
+          String(normalized.imageUri).startsWith('file://') ||
+          String(normalized.imageUri).startsWith('content://') ||
+          (String(normalized.imageUri).startsWith('http') && !String(normalized.imageUri).includes(CATALOG_STORAGE_FOLDER))
+        )
+      );
+      const needsCoverOptimization = Boolean(
+        normalized.groupCoverUri && (
+          isInlineImageDataUri(normalized.groupCoverUri) ||
+          String(normalized.groupCoverUri).startsWith('file://') ||
+          String(normalized.groupCoverUri).startsWith('content://') ||
+          (String(normalized.groupCoverUri).startsWith('http') && !String(normalized.groupCoverUri).includes(CATALOG_STORAGE_FOLDER))
+        )
+      );
+
+      if (!needsImageOptimization && !needsCoverOptimization) continue;
+
+      let updatedMaterial = { ...normalized };
+
+      if (needsImageOptimization) {
+        const uploaded = await uploadCatalogImageAsThumbnail({
+          imageUri: normalized.imageUri,
+          folder: CATALOG_STORAGE_FOLDER,
+          fileKey: `${normalized.id}-thumbnail`
+        });
+        updatedMaterial.imageUri = uploaded.imageUri;
+        updatedMaterial.imageStoragePath = uploaded.storagePath;
+      }
+
+      if (needsCoverOptimization) {
+        const uploaded = await uploadCatalogImageAsThumbnail({
+          imageUri: normalized.groupCoverUri,
+          folder: CATALOG_STORAGE_FOLDER,
+          fileKey: `${normalized.familyName || normalized.id}-cover-thumbnail`
+        });
+        updatedMaterial.groupCoverUri = uploaded.imageUri;
+        updatedMaterial.groupCoverStoragePath = uploaded.storagePath;
+      }
+
+      updatedMaterial.updatedAt = new Date().toISOString();
+      firebasePatch[updatedMaterial.id] = updatedMaterial;
+      migratedCount += 1;
+    }
+
+    if (migratedCount === 0) return 0;
+
+    const materialsUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials.json`);
+    const response = await fetch(materialsUrl, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(firebasePatch)
+    });
+
+    if (!response.ok) throw new Error(`Firebase thumbnail migration failed: ${response.status}`);
+    await setRemoteCatalogUpdatedAt();
+    await this.syncCatalogFromFirebase();
+    return migratedCount;
+  },
+
   /**
    * Adds one material to Firebase without replacing the full catalog.
    */
@@ -850,7 +1285,7 @@ export const StorageService = {
       await ensureSharedDataEditor();
       const now = new Date().toISOString();
       const userLabel = await getCurrentAuditUserLabel();
-      const preparedMaterial = normalizeMaterial({
+      let preparedMaterial = normalizeMaterial({
         ...material,
         createdAt: material.createdAt || now,
         updatedAt: now,
@@ -879,6 +1314,8 @@ export const StorageService = {
         throw new Error('DUPLICATE_MATERIAL');
       }
 
+      preparedMaterial = await saveCatalogImagesToFirebaseStorage(preparedMaterial);
+
       const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${preparedMaterial.id}.json`);
       const response = await fetch(materialUrl, {
         method: 'PUT',
@@ -890,6 +1327,7 @@ export const StorageService = {
         throw new Error(`Firebase save failed: ${response.status}`);
       }
 
+      await setRemoteCatalogUpdatedAt();
       const updatedCatalog = sortCatalog([...existingCatalog, preparedMaterial]);
       await this.saveCatalogCache(updatedCatalog);
       return preparedMaterial;
@@ -918,7 +1356,7 @@ export const StorageService = {
       const userLabel = await getCurrentAuditUserLabel();
       const now = new Date().toISOString();
 
-      const normalizedUpdates = materialVariants.map((variant) => normalizeMaterial({
+      let normalizedUpdates = materialVariants.map((variant) => normalizeMaterial({
         ...variant,
         id: variant.id,
         name: (variant.name || '').trim(),
@@ -933,6 +1371,8 @@ export const StorageService = {
         updatedBy: userLabel
       }));
 
+      normalizedUpdates = await Promise.all(normalizedUpdates.map(saveCatalogImagesToFirebaseStorage));
+
       const idsBeingUpdated = new Set(normalizedUpdates.map((item) => item.id));
       const duplicate = existingCatalog.some((existingItem) => {
         if (idsBeingUpdated.has(existingItem.id)) return false;
@@ -944,6 +1384,23 @@ export const StorageService = {
 
       if (duplicate) {
         throw new Error('DUPLICATE_MATERIAL');
+      }
+
+      const existingById = new Map(existingCatalog.map((item) => [item.id, item]));
+      for (const updatedMaterial of normalizedUpdates) {
+        const existingMaterial = existingById.get(updatedMaterial.id) || {};
+        const oldCatalogImagePath = resolveStoragePath(existingMaterial.imageStoragePath, existingMaterial.imageUri);
+        const newCatalogImagePath = resolveStoragePath(updatedMaterial.imageStoragePath, updatedMaterial.imageUri);
+        const oldCoverImagePath = resolveStoragePath(existingMaterial.groupCoverStoragePath, existingMaterial.groupCoverUri);
+        const newCoverImagePath = resolveStoragePath(updatedMaterial.groupCoverStoragePath, updatedMaterial.groupCoverUri);
+
+        if (oldCatalogImagePath && oldCatalogImagePath !== newCatalogImagePath) {
+          await deleteFirebaseStorageFileIfPossible(oldCatalogImagePath);
+        }
+
+        if (oldCoverImagePath && oldCoverImagePath !== newCoverImagePath) {
+          await deleteFirebaseStorageFileIfPossible(oldCoverImagePath);
+        }
       }
 
       const firebasePatch = {};
@@ -962,6 +1419,7 @@ export const StorageService = {
         throw new Error(`Firebase material family update failed: ${response.status}`);
       }
 
+      await setRemoteCatalogUpdatedAt();
       const updateMap = new Map(normalizedUpdates.map((item) => [item.id, item]));
       const updatedCatalog = sortCatalog(existingCatalog.map((item) => updateMap.get(item.id) || item));
       await this.saveCatalogCache(updatedCatalog);
@@ -999,7 +1457,8 @@ export const StorageService = {
       }
 
       const userLabel = await getCurrentAuditUserLabel();
-      const updatedMaterial = normalizeMaterial({
+      const existingMaterial = existingCatalog.find((item) => item.id === materialId) || {};
+      let updatedMaterial = normalizeMaterial({
         ...materialChanges,
         id: materialId,
         name: cleanName,
@@ -1014,6 +1473,21 @@ export const StorageService = {
         updatedBy: userLabel
       });
 
+      updatedMaterial = await saveCatalogImagesToFirebaseStorage(updatedMaterial);
+
+      const oldCatalogImagePath = resolveStoragePath(existingMaterial.imageStoragePath, existingMaterial.imageUri);
+      const oldCoverImagePath = resolveStoragePath(existingMaterial.groupCoverStoragePath, existingMaterial.groupCoverUri);
+      const imageWasRemovedOrReplaced = oldCatalogImagePath && oldCatalogImagePath !== resolveStoragePath(updatedMaterial.imageStoragePath, updatedMaterial.imageUri);
+      const coverWasRemovedOrReplaced = oldCoverImagePath && oldCoverImagePath !== resolveStoragePath(updatedMaterial.groupCoverStoragePath, updatedMaterial.groupCoverUri);
+
+      if (imageWasRemovedOrReplaced) {
+        await deleteFirebaseStorageFileIfPossible(oldCatalogImagePath);
+      }
+
+      if (coverWasRemovedOrReplaced) {
+        await deleteFirebaseStorageFileIfPossible(oldCoverImagePath);
+      }
+
       const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
       const response = await fetch(materialUrl, {
         method: 'PATCH',
@@ -1024,6 +1498,8 @@ export const StorageService = {
       if (!response.ok) {
         throw new Error(`Firebase material update failed: ${response.status}`);
       }
+
+      await setRemoteCatalogUpdatedAt();
 
       const updatedCatalog = sortCatalog(
         existingCatalog.map((item) => (item.id === materialId ? updatedMaterial : item))
@@ -1050,13 +1526,37 @@ export const StorageService = {
       }
 
       const userLabel = await getCurrentAuditUserLabel();
+      const now = new Date().toISOString();
+      const existingCatalog = await this.loadCatalogCache();
+      const existingMaterial = existingCatalog.find((item) => item.id === materialId) || {};
+      const oldImageStoragePath = resolveStoragePath(existingMaterial.imageStoragePath, existingMaterial.imageUri);
+      const cleanImageUri = imageUri || '';
+
+      let finalImageUri = '';
+      let finalImageStoragePath = '';
+
+      if (cleanImageUri) {
+        const uploadResult = await uploadCatalogImageAsThumbnail({
+          imageUri: cleanImageUri,
+          folder: CATALOG_STORAGE_FOLDER,
+          fileKey: `${materialId}-thumbnail`
+        });
+        finalImageUri = uploadResult.imageUri || cleanImageUri;
+        finalImageStoragePath = uploadResult.storagePath || '';
+      }
+
+      if (oldImageStoragePath && oldImageStoragePath !== finalImageStoragePath) {
+        await deleteFirebaseStorageFileIfPossible(oldImageStoragePath);
+      }
+
       const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
       const response = await fetch(materialUrl, {
         method: 'PATCH',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          imageUri: imageUri || '',
-          updatedAt: new Date().toISOString(),
+          imageUri: finalImageUri,
+          imageStoragePath: finalImageStoragePath,
+          updatedAt: now,
           updatedBy: userLabel
         })
       });
@@ -1065,10 +1565,10 @@ export const StorageService = {
         throw new Error(`Firebase image update failed: ${response.status}`);
       }
 
-      const existingCatalog = await this.loadCatalogCache();
+      await setRemoteCatalogUpdatedAt();
       const updatedCatalog = existingCatalog.map((item) => (
         item.id === materialId
-          ? { ...item, imageUri: imageUri || '', updatedAt: new Date().toISOString(), updatedBy: userLabel }
+          ? { ...item, imageUri: finalImageUri, imageStoragePath: finalImageStoragePath, updatedAt: now, updatedBy: userLabel }
           : item
       ));
       await this.saveCatalogCache(updatedCatalog);
@@ -1100,6 +1600,7 @@ export const StorageService = {
       throw new Error(`Firebase seed failed: ${response.status}`);
     }
 
+    await setRemoteCatalogUpdatedAt();
     await this.saveCatalogCache(preparedCatalog);
     return preparedCatalog;
   },
@@ -1126,6 +1627,7 @@ export const StorageService = {
         throw new Error(`Firebase saveCatalog failed: ${response.status}`);
       }
 
+      await setRemoteCatalogUpdatedAt();
       const existingCatalog = await this.loadCatalogCache();
       const mergedById = [...existingCatalog, ...preparedCatalog].reduce((accumulator, material) => {
         accumulator[material.id] = material;
@@ -1272,7 +1774,9 @@ export const StorageService = {
       await ensureSharedDataEditor();
       const now = new Date().toISOString();
       const userLabel = await getCurrentAuditUserLabel();
-      const normalized = normalizeImportantInfoItem({
+      const existingItems = await this.loadImportantInfo();
+      const existingItem = existingItems.find((currentItem) => currentItem.id === item.id) || {};
+      let normalized = normalizeImportantInfoItem({
         ...item,
         id: item.id || `info-${Date.now()}`,
         createdAt: item.createdAt || now,
@@ -1280,6 +1784,13 @@ export const StorageService = {
         createdBy: item.createdBy || userLabel,
         updatedBy: userLabel
       });
+
+      normalized = await saveImportantInfoImageToFirebaseStorage(normalized);
+
+      const oldImportantInfoImagePath = resolveStoragePath(existingItem.imageStoragePath, existingItem.imageUri);
+      if (oldImportantInfoImagePath && oldImportantInfoImagePath !== normalized.imageStoragePath) {
+        await deleteFirebaseStorageFileIfPossible(oldImportantInfoImagePath);
+      }
 
       const infoUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/importantInfo/${normalized.id}.json`);
       const response = await fetch(infoUrl, {
@@ -1289,7 +1800,6 @@ export const StorageService = {
       });
       if (!response.ok) throw new Error(`Firebase info save failed: ${response.status}`);
 
-      const existingItems = await this.loadImportantInfo();
       const withoutOldItem = existingItems.filter((currentItem) => currentItem.id !== normalized.id);
       const updatedItems = sortImportantInfo([...withoutOldItem, normalized]);
       await this.saveImportantInfoCache(updatedItems);
@@ -1309,12 +1819,15 @@ export const StorageService = {
       if (user?.role !== 'owner') throw new Error('ONLY_OWNER_CAN_PERMANENTLY_DELETE');
 
       if (!itemId) return false;
+      const existingItems = await this.loadImportantInfoCache();
+      const itemToDelete = existingItems.find((item) => item.id === itemId);
+      await deleteFirebaseStorageFileIfPossible(itemToDelete?.imageStoragePath);
+
       const infoUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/importantInfo/${itemId}.json`);
       const response = await fetch(infoUrl, {
         method: 'DELETE'
       });
       if (!response.ok) throw new Error(`Firebase info delete failed: ${response.status}`);
-      const existingItems = await this.loadImportantInfoCache();
       await this.saveImportantInfoCache(existingItems.filter((item) => item.id !== itemId));
       await removeImportantInfoRowFromSQLite(itemId);
       return true;
@@ -1620,13 +2133,18 @@ export const StorageService = {
       }
 
       if (!materialId) return false;
+      const existingCatalog = await this.loadCatalogCache();
+      const materialToDelete = existingCatalog.find((item) => item.id === materialId);
+      await deleteFirebaseStorageFileIfPossible(materialToDelete?.imageStoragePath);
+      await deleteFirebaseStorageFileIfPossible(materialToDelete?.groupCoverStoragePath);
+
       const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
       const response = await fetch(materialUrl, {
         method: 'DELETE'
       });
       if (!response.ok) throw new Error(`Firebase material permanent delete failed: ${response.status}`);
 
-      const existingCatalog = await this.loadCatalogCache();
+      await setRemoteCatalogUpdatedAt();
       await this.saveCatalogCache(existingCatalog.filter((item) => item.id !== materialId));
       await removeCatalogRowFromSQLite(materialId);
       return true;

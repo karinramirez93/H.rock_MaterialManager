@@ -11,6 +11,7 @@ import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react'
 import { StyleSheet, Text, View, FlatList, TextInput, TouchableOpacity, Modal, ActivityIndicator, Image, Alert, ScrollView, BackHandler, RefreshControl, KeyboardAvoidingView, Platform, Dimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StorageService } from '../database/storage';
+import CachedCatalogImage from '../components/CachedCatalogImage';
 import { useFocusEffect } from '@react-navigation/native';
 import * as ImagePicker from 'expo-image-picker';
 import * as ImageManipulator from 'expo-image-manipulator';
@@ -207,6 +208,7 @@ const buildCatalogDisplayItems = (items) => {
       return {
         ...firstVariant,
         variants: sortedVariants,
+        familyDisplayMode: firstVariant.familyDisplayMode || 'grid',
         imageUri: firstVariant.imageUri || getSharedFamilyImageUri(sortedVariants)
       };
     }
@@ -220,6 +222,8 @@ const buildCatalogDisplayItems = (items) => {
       variants: sortedVariants,
       size: 'N/A',
       imageUri: getSharedFamilyImageUri(sortedVariants),
+      description: firstVariant.groupDescription || '',
+      familyDisplayMode: sortedVariants.find((variant) => variant.familyDisplayMode)?.familyDisplayMode || 'grid',
       availableSizes: hasSizeVariants ? sortedVariants.map((variant) => variant.size).filter((size) => size && size !== 'N/A') : [],
       availableColors: hasColorVariants ? sortedVariants.map((variant) => getConductorColor(variant)).filter(Boolean) : []
     };
@@ -318,6 +322,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   const [editName, setEditName] = useState('');
   const [editCategory, setEditCategory] = useState('Others');
   const [editDescription, setEditDescription] = useState('');
+  const [editFamilyDisplayMode, setEditFamilyDisplayMode] = useState('grid');
   const [editForceShowDescription, setEditForceShowDescription] = useState(false);
   const [groupCoverImageUri, setGroupCoverImageUri] = useState('');
   const [editImageUri, setEditImageUri] = useState('');
@@ -414,9 +419,9 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
         if (fetchedUnits && fetchedUnits.length > 0) setUnitOptions(fetchedUnits);
         setLoading(false);
       }
-      const cloudData = await StorageService.syncCatalogFromFirebase();
+      const cloudData = await StorageService.syncCatalogIfChanged();
       applyCatalogToScreen(cloudData);
-      setLastSyncMessage(`Last sync: ${new Date().toLocaleTimeString()}`);
+      setLastSyncMessage(`Checked: ${new Date().toLocaleTimeString()}`);
     } catch (error) {
       console.error('Catalog manager load error:', error);
       const fallbackData = await StorageService.loadCatalog();
@@ -441,6 +446,40 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     } finally {
       setRefreshing(false);
     }
+  };
+
+
+  const migrateCatalogImagesToThumbnails = async () => {
+    if (!isOwner) {
+      Alert.alert('Owner Required', 'Only the owner can run image cleanup/migration.');
+      return;
+    }
+
+    Alert.alert(
+      'Optimize Catalog Images',
+      'This will convert old large catalog images stored in Realtime Database into small Firebase Storage thumbnails. Important Info images keep their high quality.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Run Optimization',
+          onPress: async () => {
+            try {
+              setRefreshing(true);
+              const count = await StorageService.migrateCatalogInlineImagesToStorageThumbnails();
+              const cloudData = await StorageService.syncCatalogFromFirebase();
+              applyCatalogToScreen(cloudData);
+              setLastSyncMessage(`Optimized ${count} image${count === 1 ? '' : 's'} at ${new Date().toLocaleTimeString()}`);
+              Alert.alert('Image Optimization Complete', `${count} catalog image${count === 1 ? '' : 's'} optimized.`);
+            } catch (error) {
+              console.error('Catalog image migration error:', error);
+              Alert.alert('Optimization Error', 'Could not optimize catalog images. Check Firebase Storage rules and owner permissions.');
+            } finally {
+              setRefreshing(false);
+            }
+          }
+        }
+      ]
+    );
   };
 
   useFocusEffect(useCallback(() => {
@@ -490,7 +529,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   };
 
   const resizeSelectedImage = async (uri) => {
-    const resizedImage = await ImageManipulator.manipulateAsync(uri, [{ resize: { width: 700 } }], { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG, base64: true });
+    const resizedImage = await ImageManipulator.manipulateAsync(uri, [{ resize: { width: 180 } }], { compress: 0.28, format: ImageManipulator.SaveFormat.JPEG, base64: true });
     return `data:image/jpeg;base64,${resizedImage.base64}`;
   };
 
@@ -603,8 +642,9 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     setShowGroupCoverPicker(Boolean(coverUri));
 
     setEditCategory(firstVariant.category || 'Others');
-    setEditDescription(firstVariant.description || '');
-    setEditForceShowDescription(firstVariant.forceShowDescription === true);
+    setEditDescription(firstVariant.groupDescription || '');
+    setEditFamilyDisplayMode((variants.find((variant) => variant.familyDisplayMode)?.familyDisplayMode || firstVariant.familyDisplayMode) === 'list' ? 'list' : 'grid');
+    setEditForceShowDescription(false);
     setEditImageUri(item.imageUri || getSharedFamilyImageUri(variants) || '');
     setAllowedUnits(Array.isArray(firstVariant.allowedUnits) && firstVariant.allowedUnits.length > 0 ? firstVariant.allowedUnits.map((u) => u === 'Rolls' ? 'Reel' : u) : getDefaultAllowedUnitsByCategory(firstVariant.category));
     setVariantDrafts(variants.map((variant) => ({
@@ -727,8 +767,10 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
           familyName: editName.trim(),
           category: editCategory,
           size: (draft.size || '').trim() || 'N/A',
-          description: (draft.description || editDescription).trim(),
-          forceShowDescription: draft.forceShowDescription !== undefined ? draft.forceShowDescription : editForceShowDescription,
+          description: (draft.description || '').trim(),
+          groupDescription: (editDescription || '').trim(),
+          forceShowDescription: draft.forceShowDescription === true,
+          familyDisplayMode: editFamilyDisplayMode,
           allowedUnits,
           imageUri: resolvedVariantImageUri,
           // Store the Group Cover URI in all variants only if the picker is enabled
@@ -819,6 +861,11 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
         <TouchableOpacity style={styles.syncButton} onPress={refreshCatalogFromFirebase} disabled={refreshing}>
           <Text style={styles.syncButtonText}>{refreshing ? 'Syncing...' : 'Sync Now'}</Text>
         </TouchableOpacity>
+        {isOwner ? (
+          <TouchableOpacity style={styles.optimizeButton} onPress={migrateCatalogImagesToThumbnails} disabled={refreshing}>
+            <Text style={styles.syncButtonText}>Optimize Images</Text>
+          </TouchableOpacity>
+        ) : null}
       </View>
 
       <View style={styles.catalogActionRow}>
@@ -881,11 +928,14 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                   <Text style={styles.checkboxText}>{isSelected ? '✓' : ''}</Text>
                 </View>
               )}
-              {item.imageUri ? (
-                <TouchableOpacity onPress={() => openZoom(item.imageUri)}>
-                  <Image source={{ uri: item.imageUri }} style={styles.thumbnail} />
-                </TouchableOpacity>
-              ) : <View style={styles.thumbnailPlaceholder}><Text style={styles.thumbnailPlaceholderText}>No Photo</Text></View>}
+              <TouchableOpacity onPress={() => item.imageUri ? openZoom(item.imageUri) : null}>
+                <CachedCatalogImage
+                  material={item}
+                  style={styles.thumbnail}
+                  placeholderStyle={styles.thumbnailPlaceholder}
+                  placeholderTextStyle={styles.thumbnailPlaceholderText}
+                />
+              </TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.itemName}>{displayName}</Text>
                 <Text style={styles.itemCategory}>{item.category}</Text>
@@ -1074,7 +1124,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                       <View style={{ flex: 1 }}>
                         <Text style={styles.variantCardTitle}>{draft.name || draft.original?.name || 'Unnamed Material'}</Text>
                         <Text style={styles.variantCardLine}>Size / Variant: {draft.size || 'N/A'}</Text>
-                        <Text style={styles.variantCardDescription} numberOfLines={2}>{draft.description || editDescription || 'No description'}</Text>
+                        <Text style={styles.variantCardDescription} numberOfLines={2}>{draft.description || 'No material description'}</Text>
                       </View>
                       <TouchableOpacity style={styles.variantDeleteButton} onPress={() => deleteSingleVariant(draft.id)} disabled={saving}>
                         <Text style={styles.variantDeleteText}>✕</Text>
@@ -1084,13 +1134,26 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                 </View>
                 <Text style={styles.helperText}>Tap any material in this family to open a focused editor for name, size, and description.</Text>
 
-                <Text style={styles.inputLabel}>Description:</Text>
-                <TextInput style={[styles.modalInput, styles.descriptionInput]} value={editDescription} onChangeText={setEditDescription} multiline placeholder="Description shown only in catalog" placeholderTextColor="#777" />
+                <Text style={styles.inputLabel}>Family / Group Catalog Description:</Text>
+                <TextInput style={[styles.modalInput, styles.descriptionInput]} value={editDescription} onChangeText={setEditDescription} multiline placeholder="Optional description for this family/group only" placeholderTextColor="#777" />
+                <Text style={styles.helperText}>This group description will not overwrite the personal description of each material. Tap a material above to edit its own description.</Text>
 
-                <TouchableOpacity style={styles.hardDeleteConfirmRow} onPress={() => setEditForceShowDescription((v) => !v)}>
-                  <Text style={[styles.hardDeleteCheckbox, { color: '#0a192f' }]}>{editForceShowDescription ? '☑' : '☐'}</Text>
-                  <Text style={[styles.hardDeleteWarning, { color: '#0a192f' }]}>Always show description during selection</Text>
-                </TouchableOpacity>
+                <Text style={styles.inputLabel}>Family Display Layout:</Text>
+                <View style={styles.grid}>
+                  <TouchableOpacity
+                    style={[styles.selector, editFamilyDisplayMode === 'grid' && styles.selectorActive]}
+                    onPress={() => setEditFamilyDisplayMode('grid')}
+                  >
+                    <Text style={[styles.selectorText, editFamilyDisplayMode === 'grid' && styles.selectorTextActive]}>SQUARE BUTTONS</Text>
+                  </TouchableOpacity>
+                  <TouchableOpacity
+                    style={[styles.selector, editFamilyDisplayMode === 'list' && styles.selectorActive]}
+                    onPress={() => setEditFamilyDisplayMode('list')}
+                  >
+                    <Text style={[styles.selectorText, editFamilyDisplayMode === 'list' && styles.selectorTextActive]}>LIST WITH PHOTO</Text>
+                  </TouchableOpacity>
+                </View>
+                <Text style={styles.helperText}>Use square buttons for sizes/colors, or list with photo for materials that need name, size, image, and description.</Text>
 
                 <Text style={styles.inputLabel}>Category:</Text>
                 <View style={styles.grid}>{categories.map((c) => <TouchableOpacity key={String(c)} style={[styles.selector, editCategory === c && styles.selectorActive]} onPress={() => { setEditCategory(c); setAllowedUnits(getDefaultAllowedUnitsByCategory(c)); }}><Text style={[styles.selectorText, editCategory === c && styles.selectorTextActive]}>{String(c).toUpperCase()}</Text></TouchableOpacity>)}</View>

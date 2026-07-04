@@ -72,12 +72,14 @@ const buildFamilyOptions = (catalog) => {
       key,
       name: familyName,
       category,
-      description: material.description || '',
+      groupDescription: material.groupDescription || '',
       allowedUnits: Array.isArray(material.allowedUnits) ? material.allowedUnits : getDefaultAllowedUnitsByCategory(category),
+      familyDisplayMode: material.familyDisplayMode || 'grid',
       count: 0
     };
     existing.count += 1;
-    if (!existing.description && material.description) existing.description = material.description;
+    if (!existing.description && material.groupDescription) existing.description = material.groupDescription;
+    if (material.familyDisplayMode === 'list') existing.familyDisplayMode = 'list';
     map.set(key, existing);
   });
   return Array.from(map.values()).sort((a, b) => a.name.localeCompare(b.name));
@@ -117,8 +119,12 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
   const [batchVariantType, setBatchVariantType] = useState('sizes');
   const [batchVariantText, setBatchVariantText] = useState('');
   const [showFamilySection, setShowFamilySection] = useState(false);
-  const [description, setDescription] = useState('');
+  const [materialDescription, setMaterialDescription] = useState('');
+  const [groupDescription, setGroupDescription] = useState('');
+  const [useMaterialDescription, setUseMaterialDescription] = useState(false);
+  const [useGroupDescription, setUseGroupDescription] = useState(false);
   const [forceShowDescription, setForceShowDescription] = useState(false);
+  const [familyDisplayMode, setFamilyDisplayMode] = useState('grid');
   const [category, setCategory] = useState('Conduits');
   const [allowedUnits, setAllowedUnits] = useState(getDefaultAllowedUnitsByCategory('Conduits'));
   const [customUnitName, setCustomUnitName] = useState('');
@@ -231,7 +237,9 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
     setSelectedFamilyKey(family.key);
     setCategory(family.category || 'Others');
     setMaterialName((current) => current.trim() ? current : family.name);
-    setDescription((current) => current.trim() ? current : family.description || '');
+    setGroupDescription((current) => current.trim() ? current : family.description || '');
+    setUseGroupDescription(Boolean(family.description));
+    setFamilyDisplayMode(family.familyDisplayMode === 'list' ? 'list' : 'grid');
     setAllowedUnits(Array.isArray(family.allowedUnits) && family.allowedUnits.length > 0 ? family.allowedUnits : getDefaultAllowedUnitsByCategory(family.category));
   };
 
@@ -299,8 +307,8 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
         Alert.alert(
           'Category Error',
           error.message === 'FIREBASE_CATEGORY_RULES_REQUIRED'
-            ? 'Firebase rejected the category update. Check Realtime Database rules for /categories and confirm this account is owner.'
-            : 'Could not add category. Only owners can perform this action.'
+            ? 'Firebase rejected the category update. Check Realtime Database rules for /categories and confirm this account is owner or editor.'
+            : 'Could not add category. Owner or editor role is required.'
         );
       }
     } finally {
@@ -347,8 +355,8 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
   const resizeSelectedImage = async (uri) => {
     const resizedImage = await ImageManipulator.manipulateAsync(
       uri,
-      [{ resize: { width: 700 } }],
-      { compress: 0.5, format: ImageManipulator.SaveFormat.JPEG, base64: true }
+      [{ resize: { width: 180 } }],
+      { compress: 0.28, format: ImageManipulator.SaveFormat.JPEG, base64: true }
     );
     return `data:image/jpeg;base64,${resizedImage.base64}`;
   };
@@ -468,11 +476,12 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
           category,
           size: skipVariantSelection ? 'N/A' : variant,
           variantType: resolvedVariantType,
-          familyDisplayMode: skipVariantSelection ? 'list' : '',
+          familyDisplayMode: familyDisplayMode,
           imageUri: showIndividualImagePicker ? imageUri : '',
           groupCoverUri: showGroupCoverPicker ? groupCoverUri : '',
-          description: description.trim(),
-          forceShowDescription,
+          description: useMaterialDescription ? materialDescription.trim() : '',
+          groupDescription: useGroupDescription ? groupDescription.trim() : '',
+          forceShowDescription: useMaterialDescription ? forceShowDescription : false,
           allowedUnits
         };
 
@@ -489,7 +498,11 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
             setBatchVariantMode(false);
             setSkipVariantSelection(false);
             setImageUri('');
-            setDescription('');
+            setMaterialDescription('');
+            setGroupDescription('');
+            setUseMaterialDescription(false);
+            setUseGroupDescription(false);
+            setFamilyDisplayMode('grid');
             setAllowedUnits(getDefaultAllowedUnitsByCategory(category));
             navigation.replace('CatalogManager');
           }
@@ -663,22 +676,71 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
             <Text style={styles.familyOptionSubText}>Family: {resolvedFamilyName() || 'Not selected yet'}</Text>
           </View>
 
-          <Text style={styles.label}>4. Description (Optional):</Text>
-          <TextInput
-            style={[styles.input, styles.descriptionInput]}
-            value={description}
-            onChangeText={setDescription}
-            placeholder="e.g.: Used for concrete anchors or exposed ceiling conduit runs"
-            placeholderTextColor="#99a"
-            multiline
-          />
-          <TouchableOpacity style={styles.checkboxRow} onPress={() => setForceShowDescription((value) => !value)}>
-            <Text style={styles.checkboxBox}>{forceShowDescription ? '☑' : '☐'}</Text>
-            <Text style={styles.familyOptionText}>Always show description during selection</Text>
-          </TouchableOpacity>
-          <Text style={styles.helperText}>Check this for materials that need special instructions to be selected correctly, like specific drill bits or tools.</Text>
+          <Text style={styles.label}>4. Family Display Layout:</Text>
+          <View style={styles.familyPickerCard}>
+            <Text style={styles.helperText}>Choose how this family opens when adding items to the Quantity Sheet.</Text>
+            <View style={styles.optionContainer}>
+              <TouchableOpacity
+                style={[styles.optionButton, familyDisplayMode === 'grid' && styles.optionButtonActive]}
+                onPress={() => setFamilyDisplayMode('grid')}
+              >
+                <Text style={[styles.optionText, familyDisplayMode === 'grid' && styles.optionTextActive]}>SQUARE BUTTONS</Text>
+                <Text style={styles.familyOptionSubText}>Best for sizes and colors.</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={[styles.optionButton, familyDisplayMode === 'list' && styles.optionButtonActive]}
+                onPress={() => setFamilyDisplayMode('list')}
+              >
+                <Text style={[styles.optionText, familyDisplayMode === 'list' && styles.optionTextActive]}>LIST WITH PHOTO</Text>
+                <Text style={styles.familyOptionSubText}>Best for text-heavy materials.</Text>
+              </TouchableOpacity>
+            </View>
+          </View>
 
-          <Text style={styles.label}>5. Category:</Text>
+          <Text style={styles.label}>5. Descriptions (Optional):</Text>
+          <TouchableOpacity style={styles.checkboxRow} onPress={() => setUseMaterialDescription((value) => !value)}>
+            <Text style={styles.checkboxBox}>{useMaterialDescription ? '☑' : '☐'}</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.familyOptionText}>Add description for this material only</Text>
+              <Text style={styles.familyOptionSubText}>This description stays personal to this material/variant. It will not change the family/group description.</Text>
+            </View>
+          </TouchableOpacity>
+          {useMaterialDescription ? (
+            <>
+              <TextInput
+                style={[styles.input, styles.descriptionInput]}
+                value={materialDescription}
+                onChangeText={setMaterialDescription}
+                placeholder="e.g.: Used for concrete anchors or exposed ceiling conduit runs"
+                placeholderTextColor="#99a"
+                multiline
+              />
+              <TouchableOpacity style={styles.checkboxRow} onPress={() => setForceShowDescription((value) => !value)}>
+                <Text style={styles.checkboxBox}>{forceShowDescription ? '☑' : '☐'}</Text>
+                <Text style={styles.familyOptionText}>Always show this material description during selection</Text>
+              </TouchableOpacity>
+            </>
+          ) : null}
+
+          <TouchableOpacity style={styles.checkboxRow} onPress={() => setUseGroupDescription((value) => !value)}>
+            <Text style={styles.checkboxBox}>{useGroupDescription ? '☑' : '☐'}</Text>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.familyOptionText}>Add description for the family/group catalog only</Text>
+              <Text style={styles.familyOptionSubText}>This describes the group in the catalog. It will not overwrite material descriptions.</Text>
+            </View>
+          </TouchableOpacity>
+          {useGroupDescription ? (
+            <TextInput
+              style={[styles.input, styles.descriptionInput]}
+              value={groupDescription}
+              onChangeText={setGroupDescription}
+              placeholder="e.g.: THHN building wire family, grouped by color"
+              placeholderTextColor="#99a"
+              multiline
+            />
+          ) : null}
+
+          <Text style={styles.label}>6. Category:</Text>
           <View style={styles.optionContainer}>
             {categories.map((cat) => (
               <TouchableOpacity key={cat} style={[styles.optionButton, category === cat && styles.optionButtonActive]} onPress={() => handleCategoryChange(cat)}>
@@ -686,7 +748,7 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
               </TouchableOpacity>
             ))}
 
-            {isOwner && (
+            {canEditSharedData && (
               <TouchableOpacity
                 style={[styles.optionButton, showAddCategory && { borderColor: '#64ffda' }]}
                 onPress={() => setShowAddCategory(!showAddCategory)}
@@ -696,7 +758,7 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
             )}
           </View>
 
-          {showAddCategory && isOwner && (
+          {showAddCategory && canEditSharedData && (
             <View style={styles.newCategoryBox}>
               <TextInput
                 style={styles.input}
@@ -721,11 +783,11 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
                   {deletingCategory ? <ActivityIndicator color="#fff" /> : <Text style={styles.btnSaveText}>DELETE SELECTED CATEGORY</Text>}
                 </TouchableOpacity>
               )}
-              <Text style={styles.helperText}>Only Owner can create or delete custom categories. Default categories are protected.</Text>
+              <Text style={styles.helperText}>Owner and Editor can create custom categories. Only Owner can delete custom categories. Default categories are protected.</Text>
             </View>
           )}
 
-          <Text style={styles.label}>6. Units to Show:</Text>
+          <Text style={styles.label}>7. Units to Show:</Text>
           <View style={styles.optionContainer}>
             {[...unitOptions, 'Custom Unit'].map((unit) => (
               <TouchableOpacity key={unit} style={[styles.optionButton, allowedUnits.includes(unit) && styles.optionButtonActive]} onPress={() => toggleAllowedUnit(unit)}>
@@ -750,7 +812,7 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
             </View>
           ) : null}
 
-          <Text style={styles.label}>7. Photo Options:</Text>
+          <Text style={styles.label}>8. Photo Options:</Text>
           <View style={styles.familyPickerCard}>
             <TouchableOpacity
               style={[styles.checkboxRow, showGroupCoverPicker && styles.checkboxRowActive]}

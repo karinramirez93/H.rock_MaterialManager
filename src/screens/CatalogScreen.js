@@ -18,6 +18,7 @@ import React, { useState, useCallback, useMemo, useRef, useEffect } from 'react'
 import { StyleSheet, Text, View, FlatList, TextInput, TouchableOpacity, Modal, ActivityIndicator, Image, ScrollView, BackHandler, Alert, RefreshControl, Dimensions } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StorageService } from '../database/storage';
+import CachedCatalogImage from '../components/CachedCatalogImage';
 import { useFocusEffect } from '@react-navigation/native';
 import { GestureHandlerRootView, GestureDetector, Gesture } from 'react-native-gesture-handler';
 import Animated, {
@@ -71,6 +72,27 @@ const ImageZoomModal = ({ visible, imageUri, onClose }) => {
           <Text style={styles.zoomInstructionText}>Pinch to zoom in/out</Text>
         </View>
       </GestureHandlerRootView>
+    </Modal>
+  );
+};
+
+
+
+const HoldImagePreviewModal = ({ imageUri }) => {
+  if (!imageUri) return null;
+
+  return (
+    <Modal visible={Boolean(imageUri)} transparent animationType="fade">
+      <View style={styles.holdPreviewOverlay} pointerEvents="none">
+        <View style={styles.holdPreviewCard}>
+          <Image
+            source={{ uri: imageUri }}
+            style={styles.holdPreviewImage}
+            resizeMode="contain"
+          />
+          <Text style={styles.holdPreviewText}>Release to close</Text>
+        </View>
+      </View>
     </Modal>
   );
 };
@@ -154,6 +176,7 @@ const getSearchableMaterialText = (material) => (
     material?.category,
     material?.size,
     material?.description,
+    material?.groupDescription,
     ...(Array.isArray(material?.keywords) ? material.keywords : [])
   ]
     .filter(Boolean)
@@ -352,6 +375,9 @@ const getConductorColor = (material) => {
   const candidateFields = [
     material?.color,
     material?.colour,
+    material?.colorName,
+    material?.wireColor,
+    material?.variantColor,
     material?.variant,
     material?.variantName,
     material?.option,
@@ -398,7 +424,20 @@ const isConductorColorFamily = (material) => Boolean(getConductorColor(material)
 // Returns the label shown on the variant buttons inside the add modal.
 // Wire families show colors. Sized families show trade sizes.
 const getFamilyVariantLabel = (variant, familyMode = '') => {
-  if (familyMode === 'color') return getConductorColor(variant) || getMaterialDisplayName(variant);
+  if (familyMode === 'color') {
+    return (
+      getConductorColor(variant) ||
+      variant?.color ||
+      variant?.colour ||
+      variant?.colorName ||
+      variant?.wireColor ||
+      variant?.variantColor ||
+      variant?.variant ||
+      variant?.variantName ||
+      variant?.option ||
+      getMaterialDisplayName(variant)
+    );
+  }
   if (variant?.size && variant.size !== 'N/A') return variant.size;
   return getMaterialDisplayName(variant);
 };
@@ -541,7 +580,8 @@ const buildCatalogDisplayItems = (items) => {
       };
     }
 
-    const familyMode = hasColorVariants ? 'color' : (hasSizeVariants ? 'size' : 'list');
+    const explicitDisplayMode = sortedVariants.find((variant) => variant.familyDisplayMode)?.familyDisplayMode || '';
+    const familyMode = explicitDisplayMode === 'list' ? 'list' : (hasColorVariants ? 'color' : (hasSizeVariants ? 'size' : 'list'));
     const availableOptions = sortedVariants
       .map((variant) => getFamilyVariantLabel(variant, familyMode))
       .filter(Boolean);
@@ -558,6 +598,7 @@ const buildCatalogDisplayItems = (items) => {
         : firstVariant.name),
       size: 'N/A',
       imageUri: getSharedFamilyImageUri(sortedVariants),
+      description: firstVariant.groupDescription || '',
       availableSizes: familyMode === 'size' ? availableOptions : [],
       availableColors: familyMode === 'color' ? availableOptions : [],
       availableNames: familyMode === 'list' ? availableOptions : []
@@ -652,6 +693,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
   const [isAddingMultipleItems, setIsAddingMultipleItems] = useState(false);
   const [zoomImageUri, setZoomImageUri] = useState('');
   const [zoomVisible, setZoomVisible] = useState(false);
+  const [holdPreviewUri, setHoldPreviewUri] = useState('');
 
   const [quantity, setQuantity] = useState('1');
   const [unit, setUnit] = useState('Unit');
@@ -756,10 +798,10 @@ export default function CatalogScreen({ navigation, currentUser }) {
           setLoading(false);
         }
 
-        const cloudData = await StorageService.syncCatalogFromFirebase();
+        const cloudData = await StorageService.syncCatalogIfChanged();
         if (isMounted) {
           applyCatalogToScreen(cloudData, true);
-          setLastSyncMessage(`Last sync: ${new Date().toLocaleTimeString()}`);
+          setLastSyncMessage(`Checked: ${new Date().toLocaleTimeString()}`);
         }
       } catch (e) {
         console.error('Catalog load focus error:', e);
@@ -997,13 +1039,14 @@ export default function CatalogScreen({ navigation, currentUser }) {
   // The catalog photo stays in the catalog and is not copied into the quantity sheet.
   const handleSingleAddConfirm = async () => {
     if (!selectedItem) return;
+    const modalFamilyDisplayModeForValidation = selectedItem?.familyMode || selectedFamilyVariants.find((variant) => variant.familyDisplayMode)?.familyDisplayMode || '';
 
     if (selectedFamilyVariants.length > 1 && selectedFamilyVariantIds.length === 0) {
       Alert.alert(
         'Select Required',
         selectedItem?.category === 'Conductors'
           ? 'Please select at least one wire color before adding this material.'
-          : selectedItem?.familyMode === 'list'
+          : modalFamilyDisplayModeForValidation === 'list'
             ? 'Please select at least one material from this family before adding.'
             : 'Please select at least one trade size before adding this material.'
       );
@@ -1200,6 +1243,15 @@ export default function CatalogScreen({ navigation, currentUser }) {
     setZoomImageUri(uri);
     setZoomVisible(true);
   };
+
+  const showHoldImagePreview = (uri) => {
+    if (!uri) return;
+    setHoldPreviewUri(uri);
+  };
+
+  const hideHoldImagePreview = () => {
+    setHoldPreviewUri('');
+  };
   const activeModalItems = isAddingMultipleItems
     ? selectedItems
     : (
@@ -1212,6 +1264,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
   const isLengthUnit = unit === 'Length (ft)' || unit === 'Length (in)';
   const shouldShowQuantityStep = !isLengthUnit;
   const sharedModalImageUri = selectedItem?.imageUri || getSharedFamilyImageUri(selectedFamilyVariants);
+  const activeFamilyDisplayMode = selectedItem?.familyMode || selectedFamilyVariants.find((variant) => variant.familyDisplayMode)?.familyDisplayMode || '';
 
   if (loading) {
     return <SafeAreaView style={[styles.container, styles.centered]} edges={['left','right','bottom']}><ActivityIndicator size="large" color="#64ffda" /></SafeAreaView>;
@@ -1290,11 +1343,21 @@ export default function CatalogScreen({ navigation, currentUser }) {
                   <Text style={styles.checkboxText}>{isSelected ? '✓' : ''}</Text>
                 </View>
               ) : null}
-              {item.imageUri ? (
-                <TouchableOpacity onPress={() => openZoom(item.imageUri)}>
-                  <Image source={{ uri: item.imageUri }} style={styles.thumbnail} />
-                </TouchableOpacity>
-              ) : <View style={styles.thumbnailPlaceholder}><Text style={styles.thumbnailPlaceholderText}>No Photo</Text></View>}
+              <TouchableOpacity
+                activeOpacity={0.9}
+                onPressIn={() => showHoldImagePreview(item.imageUri)}
+                onPressOut={hideHoldImagePreview}
+                onLongPress={() => showHoldImagePreview(item.imageUri)}
+                delayLongPress={120}
+              >
+                <CachedCatalogImage
+                  material={item}
+                  style={styles.thumbnail}
+                  placeholderStyle={styles.thumbnailPlaceholder}
+                  placeholderTextStyle={styles.thumbnailPlaceholderText}
+                  resizeMode="contain"
+                />
+              </TouchableOpacity>
               <View style={{ flex: 1 }}>
                 <Text style={styles.itemName}>{displayName}</Text>
                 <Text style={styles.itemCategory}>{item.category}</Text>
@@ -1416,8 +1479,14 @@ export default function CatalogScreen({ navigation, currentUser }) {
                       return (
                         <View key={`${item.id || item.name || 'selected-material'}-${index}`} style={styles.selectedMaterialRow}>
                           {item.imageUri ? (
-                            <TouchableOpacity onPress={() => openZoom(item.imageUri)}>
-                              <Image source={{ uri: item.imageUri }} style={styles.selectedMaterialThumbnail} />
+                            <TouchableOpacity
+                              activeOpacity={0.9}
+                              onPressIn={() => showHoldImagePreview(item.imageUri)}
+                              onPressOut={hideHoldImagePreview}
+                              onLongPress={() => showHoldImagePreview(item.imageUri)}
+                              delayLongPress={120}
+                            >
+                              <CachedCatalogImage material={item} style={styles.selectedMaterialThumbnail} resizeMode="contain" />
                             </TouchableOpacity>
                           ) : (
                             <View style={[styles.materialColorDot, { backgroundColor: getMaterialColorCode(item) }]} />
@@ -1478,51 +1547,75 @@ export default function CatalogScreen({ navigation, currentUser }) {
 
                 {!isAddingMultipleItems && selectedFamilyVariants.length > 1 ? (
                   <View style={styles.modalSection}>
-                    <Text style={styles.sectionTitle}>2. Select {selectedItem?.category === 'Conductors' ? 'Color' : selectedItem?.familyMode === 'list' ? 'Material' : 'Size'}</Text>
+                    <Text style={styles.sectionTitle}>2. Select {selectedItem?.category === 'Conductors' ? 'Color' : activeFamilyDisplayMode === 'list' ? 'Material' : 'Size'}</Text>
                     <Text style={styles.sizeInstruction}>
                       {selectedItem?.category === 'Conductors'
                         ? 'Choose one or more wire colors. Each selected color will be added as an individual line.'
-                        : selectedItem?.familyMode === 'list'
+                        : activeFamilyDisplayMode === 'list'
                           ? 'Choose one or more materials from this family. Each selected material will be added as an individual line.'
                           : 'Choose one or more trade sizes. Each selected size will be added as an individual line.'}
                     </Text>
 
-                    {selectedFamilyVariants.some(v => v.imageUri) ? (
-                      <View style={styles.subCatalogGrid}>
+                    {activeFamilyDisplayMode === 'list' ? (
+                      <View style={styles.subCatalogList}>
                         {selectedFamilyVariants.map((variant) => {
                           const isVariantSelected = selectedFamilyVariantIds.includes(variant.id);
-                          const variantLabel = getFamilyVariantLabel(variant, selectedItem?.familyMode);
-
+                          const variantDescription = String(variant.description || '').trim();
                           return (
                             <TouchableOpacity
                               key={variant.id}
-                              style={[styles.subCatalogCard, isVariantSelected && styles.subCatalogCardActive]}
+                              style={[styles.subCatalogListRow, isVariantSelected && styles.subCatalogListRowActive]}
                               onPress={() => toggleFamilyVariant(variant)}
+                              onPressIn={() => {
+                                if (variant.description) {
+                                  timersRef.current[variant.id] = setTimeout(() => {
+                                    showVariantDescription(variant);
+                                  }, 600);
+                                }
+                              }}
+                              onPressOut={() => {
+                                if (timersRef.current[variant.id]) {
+                                  clearTimeout(timersRef.current[variant.id]);
+                                  delete timersRef.current[variant.id];
+                                }
+                              }}
                             >
-                              <View style={styles.subCatalogImageContainer}>
-                                {variant.imageUri ? (
-                                  <Image source={{ uri: variant.imageUri }} style={styles.subCatalogImage} />
-                                ) : (
-                                  <View style={styles.subCatalogPlaceholder}>
-                                    <Text style={styles.subCatalogPlaceholderText}>No Photo</Text>
-                                  </View>
-                                )}
-                                {isVariantSelected && (
-                                  <View style={styles.subCatalogCheckBadge}>
-                                    <Text style={styles.subCatalogCheckText}>✓</Text>
-                                  </View>
-                                )}
-                              </View>
-                              <View style={styles.subCatalogInfo}>
-                                <Text style={[styles.subCatalogText, isVariantSelected && styles.subCatalogTextActive]} numberOfLines={2}>
-                                  {variantLabel}
+                              {variant.imageUri ? (
+                                <TouchableOpacity
+                                  activeOpacity={0.9}
+                                  onPressIn={() => showHoldImagePreview(variant.imageUri)}
+                                  onPressOut={hideHoldImagePreview}
+                                  onLongPress={() => showHoldImagePreview(variant.imageUri)}
+                                  delayLongPress={120}
+                                >
+                                  <CachedCatalogImage material={variant} style={styles.subCatalogListImage} resizeMode="contain" />
+                                </TouchableOpacity>
+                              ) : (
+                                <View style={styles.subCatalogListPlaceholder}>
+                                  <Text style={styles.subCatalogPlaceholderText}>No Photo</Text>
+                                </View>
+                              )}
+                              <View style={styles.subCatalogListInfo}>
+                                <Text style={[styles.subCatalogListTitle, isVariantSelected && styles.subCatalogTextActive]} numberOfLines={1}>
+                                  {variant.name || getMaterialDisplayName(variant)}
                                 </Text>
+                                <Text style={styles.subCatalogListVariant} numberOfLines={1}>
+                                  Size / Variant: {variant.size && variant.size !== 'N/A' ? variant.size : 'N/A'}
+                                </Text>
+                                {variantDescription ? (
+                                  <Text style={styles.subCatalogListDescription} numberOfLines={2}>{variantDescription}</Text>
+                                ) : null}
                               </View>
+                              {isVariantSelected && (
+                                <View style={styles.subCatalogCheckBadge}>
+                                  <Text style={styles.subCatalogCheckText}>✓</Text>
+                                </View>
+                              )}
                             </TouchableOpacity>
                           );
                         })}
                       </View>
-                    ) : selectedItem?.familyMode === 'color' ? (
+                    ) : (selectedItem?.familyMode === 'color' || selectedItem?.category === 'Conductors') ? (
                       <View style={styles.colorSelectionGrid}>
                         {selectedFamilyVariants.map((variant) => {
                           const variantLabel = getFamilyVariantLabel(variant, 'color');
@@ -1548,8 +1641,57 @@ export default function CatalogScreen({ navigation, currentUser }) {
                             >
                               <View style={[styles.colorGridDot, { backgroundColor: getColorCodeByName(variantLabel) }]} />
                               <Text style={[styles.colorGridText, isVariantSelected && styles.colorGridTextActive]} numberOfLines={1}>
-                                {variantLabel}
+                                {variantLabel || 'Color'}
                               </Text>
+                              {isVariantSelected && (
+                                <View style={styles.sizeGridCheck}>
+                                  <Text style={styles.sizeGridCheckText}>✓</Text>
+                                </View>
+                              )}
+                            </TouchableOpacity>
+                          );
+                        })}
+                      </View>
+                    ) : selectedFamilyVariants.some(v => v.imageUri) ? (
+                      <View style={styles.subCatalogGrid}>
+                        {selectedFamilyVariants.map((variant) => {
+                          const isVariantSelected = selectedFamilyVariantIds.includes(variant.id);
+                          const variantLabel = getFamilyVariantLabel(variant, activeFamilyDisplayMode);
+
+                          return (
+                            <TouchableOpacity
+                              key={variant.id}
+                              style={[styles.subCatalogCard, isVariantSelected && styles.subCatalogCardActive]}
+                              onPress={() => toggleFamilyVariant(variant)}
+                            >
+                              <View style={styles.subCatalogImageContainer}>
+                                {variant.imageUri ? (
+                                  <TouchableOpacity
+                                    activeOpacity={0.9}
+                                    style={styles.subCatalogImagePressArea}
+                                    onPressIn={() => showHoldImagePreview(variant.imageUri)}
+                                    onPressOut={hideHoldImagePreview}
+                                    onLongPress={() => showHoldImagePreview(variant.imageUri)}
+                                    delayLongPress={120}
+                                  >
+                                    <CachedCatalogImage material={variant} style={styles.subCatalogImage} resizeMode="contain" />
+                                  </TouchableOpacity>
+                                ) : (
+                                  <View style={styles.subCatalogPlaceholder}>
+                                    <Text style={styles.subCatalogPlaceholderText}>No Photo</Text>
+                                  </View>
+                                )}
+                                {isVariantSelected && (
+                                  <View style={styles.subCatalogCheckBadge}>
+                                    <Text style={styles.subCatalogCheckText}>✓</Text>
+                                  </View>
+                                )}
+                              </View>
+                              <View style={styles.subCatalogInfo}>
+                                <Text style={[styles.subCatalogText, isVariantSelected && styles.subCatalogTextActive]} numberOfLines={2}>
+                                  {variantLabel}
+                                </Text>
+                              </View>
                             </TouchableOpacity>
                           );
                         })}
@@ -1561,7 +1703,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
                           return (
                             <TouchableOpacity
                               key={variant.id}
-                              style={[styles.sizeGridButton, selectedItem?.familyMode === 'list' && styles.sizeGridButtonWide, isVariantSelected && styles.sizeGridButtonActive]}
+                              style={[styles.sizeGridButton, activeFamilyDisplayMode === 'list' && styles.sizeGridButtonWide, isVariantSelected && styles.sizeGridButtonActive]}
                               onPress={() => toggleFamilyVariant(variant)}
                               onPressIn={() => {
                                 if (variant.description) {
@@ -1578,7 +1720,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
                               }}
                             >
                               <Text style={[styles.sizeGridButtonText, isVariantSelected && styles.sizeGridButtonTextActive]}>
-                                {selectedItem?.familyMode === 'list' ? getMaterialDisplayName(variant) : variant.size}
+                                {activeFamilyDisplayMode === 'list' ? getMaterialDisplayName(variant) : variant.size}
                               </Text>
                               {variant.forceShowDescription && variant.description && (
                                 <View style={styles.infoIndicator}>
@@ -1739,6 +1881,8 @@ export default function CatalogScreen({ navigation, currentUser }) {
           </SafeAreaView>
         </View>
       </Modal>
+
+      <HoldImagePreviewModal imageUri={holdPreviewUri} />
 
       <ImageZoomModal
         visible={zoomVisible}
@@ -2097,6 +2241,44 @@ const styles = StyleSheet.create({
     fontSize: 12
   },
 
+
+  holdPreviewOverlay: {
+    position: 'absolute',
+    top: 0,
+    left: 0,
+    right: 0,
+    bottom: 0,
+    zIndex: 99999,
+    elevation: 99999,
+    backgroundColor: 'rgba(0, 0, 0, 0.72)',
+    justifyContent: 'center',
+    alignItems: 'center',
+    padding: 18,
+  },
+  holdPreviewCard: {
+    width: '92%',
+    maxWidth: 420,
+    borderRadius: 18,
+    backgroundColor: '#0a192f',
+    borderWidth: 1,
+    borderColor: '#64ffda',
+    padding: 12,
+    alignItems: 'center',
+  },
+  holdPreviewImage: {
+    width: '100%',
+    height: Math.min(SCREEN_HEIGHT * 0.62, 520),
+    borderRadius: 14,
+    backgroundColor: '#020c1b',
+  },
+  holdPreviewText: {
+    color: '#ccd6f6',
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 10,
+    textAlign: 'center',
+  },
+
   miniStepper: {
     flexDirection: 'row',
     alignItems: 'center',
@@ -2123,6 +2305,65 @@ const styles = StyleSheet.create({
     fontWeight: 'bold',
     color: '#1e293b',
     padding: 0
+  },
+
+  subCatalogList: {
+    gap: 10,
+    marginTop: 10
+  },
+  subCatalogListRow: {
+    backgroundColor: '#fff',
+    borderWidth: 1,
+    borderColor: '#cbd5e1',
+    borderRadius: 10,
+    padding: 10,
+    flexDirection: 'row',
+    alignItems: 'center',
+    position: 'relative'
+  },
+  subCatalogListRowActive: {
+    backgroundColor: '#eff6ff',
+    borderColor: '#0867df',
+    borderWidth: 2
+  },
+  subCatalogListImage: {
+    width: 58,
+    height: 58,
+    borderRadius: 8,
+    marginRight: 10,
+    backgroundColor: '#f3f4f6'
+  },
+  subCatalogListPlaceholder: {
+    width: 58,
+    height: 58,
+    borderRadius: 8,
+    marginRight: 10,
+    backgroundColor: '#f3f4f6',
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: '#dbe3ef'
+  },
+  subCatalogListInfo: {
+    flex: 1,
+    paddingRight: 20
+  },
+  subCatalogListTitle: {
+    color: '#111827',
+    fontSize: 14,
+    fontWeight: '900'
+  },
+  subCatalogListVariant: {
+    color: '#0867df',
+    fontSize: 12,
+    fontWeight: '800',
+    marginTop: 3
+  },
+  subCatalogListDescription: {
+    color: '#475569',
+    fontSize: 11,
+    marginTop: 4,
+    lineHeight: 15
   },
 
   // Sub-Catalog Layout Styles
