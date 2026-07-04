@@ -1,6 +1,6 @@
 import 'react-native-gesture-handler';
-import React, { useEffect, useState } from 'react';
-import { ActivityIndicator, StyleSheet, View, Text, TouchableOpacity } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { ActivityIndicator, Alert, BackHandler, StyleSheet, View, Text, TouchableOpacity } from 'react-native';
 import { NavigationContainer } from '@react-navigation/native';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { SafeAreaProvider } from 'react-native-safe-area-context';
@@ -30,8 +30,38 @@ const Stack = createNativeStackNavigator();
  * Created By value and in StorageService audit fields.
  */
 export default function App() {
+  const navigationRef = useRef(null);
   const [authLoading, setAuthLoading] = useState(true);
   const [currentUser, setCurrentUser] = useState(null);
+
+
+
+  /**
+   * Global Android back behavior.
+   * Screen-level handlers still run first when a modal or editor is open.
+   * If no screen consumes the event, this handler moves back in the stack.
+   * On the home Material Requisition screen, it asks before closing the app.
+   */
+  useEffect(() => {
+    if (!currentUser) return undefined;
+
+    const subscription = BackHandler.addEventListener('hardwareBackPress', () => {
+      const navigation = navigationRef.current;
+
+      if (navigation?.canGoBack()) {
+        navigation.goBack();
+        return true;
+      }
+
+      Alert.alert('Exit App', 'Do you want to close Material Manager?', [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Exit', style: 'destructive', onPress: () => BackHandler.exitApp() }
+      ]);
+      return true;
+    });
+
+    return () => subscription.remove();
+  }, [currentUser]);
 
   useEffect(() => {
     const loadCurrentUser = async () => {
@@ -68,7 +98,7 @@ export default function App() {
   return (
     <GestureHandlerRootView style={styles.container}>
       <SafeAreaProvider>
-        <NavigationContainer>
+        <NavigationContainer ref={navigationRef}>
           <Stack.Navigator
             initialRouteName="Draft"
             screenOptions={({ navigation, route }) => ({

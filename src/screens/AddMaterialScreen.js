@@ -113,6 +113,10 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
   const [materialName, setMaterialName] = useState('');
   const [size, setSize] = useState('');
   const [skipVariantSelection, setSkipVariantSelection] = useState(false);
+  const [batchVariantMode, setBatchVariantMode] = useState(false);
+  const [batchVariantType, setBatchVariantType] = useState('sizes');
+  const [batchVariantText, setBatchVariantText] = useState('');
+  const [showFamilySection, setShowFamilySection] = useState(false);
   const [description, setDescription] = useState('');
   const [forceShowDescription, setForceShowDescription] = useState(false);
   const [category, setCategory] = useState('Conduits');
@@ -158,6 +162,11 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
 
   const selectedFamily = familyOptions.find((family) => family.key === selectedFamilyKey);
 
+  const parseBatchVariants = () => batchVariantText
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+
   const filteredFamilyOptions = useMemo(() => {
     const text = familySearchText.trim().toLowerCase();
     const materialText = materialName.trim();
@@ -191,6 +200,21 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
     const cleanSize = size.trim();
     const sizeText = (!skipVariantSelection && cleanSize) ? ` ${cleanSize}` : '';
     return cleanName ? `${cleanName}${sizeText}` : 'Material preview';
+  };
+
+  const getPreviewColorCode = () => {
+    const s = size.trim().toLowerCase();
+    if (s.includes('black')) return '#000000';
+    if (s.includes('blue')) return '#1266d6';
+    if (s.includes('brown')) return '#8b2f17';
+    if (s.includes('gray') || s.includes('grey')) return '#9ca3af';
+    if (s.includes('green')) return '#14883b';
+    if (s.includes('orange')) return '#f97316';
+    if (s.includes('purple')) return '#7e22ce';
+    if (s.includes('red')) return '#dc2626';
+    if (s.includes('white')) return '#f8fafc';
+    if (s.includes('yellow')) return '#eab308';
+    return null;
   };
 
   const handleCategoryChange = (selectedCategory) => {
@@ -391,6 +415,7 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
   const handleSaveMaterial = async () => {
     const finalMaterialName = resolvedMaterialName();
     const finalFamilyName = resolvedFamilyName();
+    const batchVariants = parseBatchVariants();
 
     if (!finalFamilyName) {
       Alert.alert('Required Field', 'Please select an existing family or create a new family name.');
@@ -402,7 +427,12 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
       return;
     }
 
-    if (!skipVariantSelection && !size.trim()) {
+    if (!skipVariantSelection && batchVariantMode && batchVariants.length === 0) {
+      Alert.alert('Required Field', 'Enter one or more sizes, colors, or variants separated by commas.');
+      return;
+    }
+
+    if (!skipVariantSelection && !batchVariantMode && !size.trim()) {
       Alert.alert('Required Field', 'Please enter the custom size, color, or variant, or check "No separate size/color/variant needed".');
       return;
     }
@@ -415,32 +445,52 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
     try {
       setSaving(true);
 
-      const newMaterial = {
-        name: finalMaterialName,
-        familyName: finalFamilyName,
-        category,
-        size: skipVariantSelection ? 'N/A' : size.trim(),
-        familyDisplayMode: skipVariantSelection ? 'list' : '',
-        imageUri: showIndividualImagePicker ? imageUri : '',
-        groupCoverUri: showGroupCoverPicker ? groupCoverUri : '',
-        description: description.trim(),
-        forceShowDescription,
-        allowedUnits
-      };
+      const variantsToCreate = skipVariantSelection
+        ? ['N/A']
+        : (batchVariantMode ? batchVariants : [size.trim()]);
 
-      await StorageService.addMaterial(newMaterial);
+      for (const variant of variantsToCreate) {
+        let resolvedVariantType = skipVariantSelection ? 'none' : batchVariantType;
 
-      Alert.alert('Success!', `"${getDisplayName()}" added to Firebase catalog.`, [
+        // If not in batch mode, we try to auto-detect if the user entered a color
+        // so it gets the correct behavior in the catalog.
+        if (!skipVariantSelection && !batchVariantMode && resolvedVariantType === 'sizes') {
+          const vLower = variant.toLowerCase();
+          const commonColors = ['black', 'red', 'blue', 'orange', 'brown', 'yellow', 'white', 'green', 'gray', 'grey', 'purple'];
+          if (commonColors.includes(vLower)) {
+            resolvedVariantType = 'colors';
+          }
+        }
+
+        const newMaterial = {
+          name: finalMaterialName,
+          familyName: finalFamilyName,
+          category,
+          size: skipVariantSelection ? 'N/A' : variant,
+          variantType: resolvedVariantType,
+          familyDisplayMode: skipVariantSelection ? 'list' : '',
+          imageUri: showIndividualImagePicker ? imageUri : '',
+          groupCoverUri: showGroupCoverPicker ? groupCoverUri : '',
+          description: description.trim(),
+          forceShowDescription,
+          allowedUnits
+        };
+
+        await StorageService.addMaterial(newMaterial);
+      }
+
+      Alert.alert('Success!', `${variantsToCreate.length} material${variantsToCreate.length === 1 ? '' : 's'} added to Firebase catalog.`, [
         {
           text: 'OK',
           onPress: () => {
             setMaterialName('');
             setSize('');
+            setBatchVariantText('');
+            setBatchVariantMode(false);
             setSkipVariantSelection(false);
             setImageUri('');
             setDescription('');
             setAllowedUnits(getDefaultAllowedUnitsByCategory(category));
-            setSkipVariantSelection(false);
             navigation.replace('CatalogManager');
           }
         }
@@ -448,7 +498,7 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
     } catch (error) {
       console.error('Error saving material:', error);
       if (error.message === 'DUPLICATE_MATERIAL') {
-        Alert.alert('Duplicate Material', 'This material name with this size already exists.');
+        Alert.alert('Duplicate Material', 'One of these material variants already exists.');
       } else {
         Alert.alert('Error', 'Could not save material to Firebase. Please check your internet connection and database rules.');
       }
@@ -458,76 +508,85 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
   };
 
   return (
-    <SafeAreaView style={styles.container} edges={['left', 'right', 'bottom']}>
+    <SafeAreaView style={styles.container} edges={['top', 'left', 'right', 'bottom']}>
       <StatusBar style="light" />
       <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={90}>
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
           <Text style={styles.title}>NEW MATERIAL TO CATALOG</Text>
 
-          <Text style={styles.label}>1. Family / Group:</Text>
-          <View style={styles.familyPickerCard}>
-            <TouchableOpacity
-              style={[styles.checkboxRow, createNewFamily && styles.checkboxRowActive]}
-              onPress={startNewFamily}
-            >
-              <Text style={styles.checkboxBox}>{createNewFamily ? '☑' : '☐'}</Text>
-              <View style={{ flex: 1 }}>
-                <Text style={[styles.familyOptionText, createNewFamily && styles.familyOptionTextActive]}>Create a new family/group</Text>
-                <Text style={styles.familyOptionSubText}>Use this when no current family matches the new material.</Text>
-              </View>
-            </TouchableOpacity>
+          <TouchableOpacity style={styles.sectionHeaderButton} onPress={() => setShowFamilySection((value) => !value)}>
+            <View style={{ flex: 1 }}>
+              <Text style={styles.label}>1. Family / Group:</Text>
+              <Text style={styles.helperTextNoMargin}>{createNewFamily ? 'New family' : selectedFamily?.name || 'Existing family'} • Tap to {showFamilySection ? 'collapse' : 'expand'}</Text>
+            </View>
+            <Text style={styles.sectionHeaderIcon}>{showFamilySection ? '▲' : '▼'}</Text>
+          </TouchableOpacity>
 
-            {createNewFamily ? (
-              <View style={styles.newFamilyPanel}>
-                <TouchableOpacity style={styles.checkboxRow} onPress={() => setUseMaterialNameForFamily((value) => !value)}>
-                  <Text style={styles.checkboxBox}>{useMaterialNameForFamily ? '☑' : '☐'}</Text>
-                  <Text style={styles.familyOptionText}>Use material name as family name</Text>
-                </TouchableOpacity>
-                {!useMaterialNameForFamily ? (
-                  <TextInput
-                    style={styles.input}
-                    value={customFamilyName}
-                    onChangeText={setCustomFamilyName}
-                    placeholder="Custom family name, e.g.: Drill Bits"
-                    placeholderTextColor="#99a"
-                  />
-                ) : null}
-              </View>
-            ) : selectedFamily ? (
-              <View style={styles.selectedFamilyPanel}>
-                <Text style={styles.previewLabel}>Selected Family</Text>
-                <Text style={styles.previewText}>{selectedFamily.name}</Text>
-                <Text style={styles.familyOptionSubText}>{selectedFamily.category} • {selectedFamily.count} existing item{selectedFamily.count === 1 ? '' : 's'}</Text>
-              </View>
-            ) : null}
+          {showFamilySection ? (
+            <View style={styles.familyPickerCard}>
+              <TouchableOpacity
+                style={[styles.checkboxRow, createNewFamily && styles.checkboxRowActive]}
+                onPress={startNewFamily}
+              >
+                <Text style={styles.checkboxBox}>{createNewFamily ? '☑' : '☐'}</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={[styles.familyOptionText, createNewFamily && styles.familyOptionTextActive]}>Create a new family/group</Text>
+                  <Text style={styles.familyOptionSubText}>Use this when no current family matches the new material.</Text>
+                </View>
+              </TouchableOpacity>
 
-            <TextInput
-              style={styles.input}
-              value={familySearchText}
-              onChangeText={setFamilySearchText}
-              placeholder="Search existing family, e.g.: Drill Bits, EMT Pipe, THHN #12"
-              placeholderTextColor="#99a"
-            />
-            <Text style={styles.helperText}>Select an existing family when the new entry is only another size, color, or variant.</Text>
-
-            <ScrollView style={{ maxHeight: 210 }} nestedScrollEnabled keyboardShouldPersistTaps="handled">
-              {filteredFamilyOptions.map((family) => {
-                const suggested = scoreFamilySuggestion(family, materialName) > 0;
-                return (
-                  <TouchableOpacity
-                    key={family.key}
-                    style={[styles.familyOption, !createNewFamily && selectedFamilyKey === family.key && styles.familyOptionActive, suggested && styles.suggestedFamilyOption]}
-                    onPress={() => selectExistingFamily(family)}
-                  >
-                    <Text style={[styles.familyOptionText, !createNewFamily && selectedFamilyKey === family.key && styles.familyOptionTextActive]}>
-                      {suggested ? 'Suggested • ' : ''}{family.name}
-                    </Text>
-                    <Text style={styles.familyOptionSubText}>{family.category} • {family.count} existing item{family.count === 1 ? '' : 's'}</Text>
+              {createNewFamily ? (
+                <View style={styles.newFamilyPanel}>
+                  <TouchableOpacity style={styles.checkboxRow} onPress={() => setUseMaterialNameForFamily((value) => !value)}>
+                    <Text style={styles.checkboxBox}>{useMaterialNameForFamily ? '☑' : '☐'}</Text>
+                    <Text style={styles.familyOptionText}>Use material name as family name</Text>
                   </TouchableOpacity>
-                );
-              })}
-            </ScrollView>
-          </View>
+                  {!useMaterialNameForFamily ? (
+                    <TextInput
+                      style={styles.input}
+                      value={customFamilyName}
+                      onChangeText={setCustomFamilyName}
+                      placeholder="Custom family name, e.g.: Drill Bits"
+                      placeholderTextColor="#99a"
+                    />
+                  ) : null}
+                </View>
+              ) : selectedFamily ? (
+                <View style={styles.selectedFamilyPanel}>
+                  <Text style={styles.previewLabel}>Selected Family</Text>
+                  <Text style={styles.previewText}>{selectedFamily.name}</Text>
+                  <Text style={styles.familyOptionSubText}>{selectedFamily.category} • {selectedFamily.count} existing item{selectedFamily.count === 1 ? '' : 's'}</Text>
+                </View>
+              ) : null}
+
+              <TextInput
+                style={styles.input}
+                value={familySearchText}
+                onChangeText={setFamilySearchText}
+                placeholder="Search existing family, e.g.: Drill Bits, EMT Pipe, THHN #12"
+                placeholderTextColor="#99a"
+              />
+              <Text style={styles.helperText}>Select an existing family when the new entry is only another size, color, or variant.</Text>
+
+              <ScrollView style={{ maxHeight: 210 }} nestedScrollEnabled keyboardShouldPersistTaps="handled">
+                {filteredFamilyOptions.map((family) => {
+                  const suggested = scoreFamilySuggestion(family, materialName) > 0;
+                  return (
+                    <TouchableOpacity
+                      key={family.key}
+                      style={[styles.familyOption, !createNewFamily && selectedFamilyKey === family.key && styles.familyOptionActive, suggested && styles.suggestedFamilyOption]}
+                      onPress={() => selectExistingFamily(family)}
+                    >
+                      <Text style={[styles.familyOptionText, !createNewFamily && selectedFamilyKey === family.key && styles.familyOptionTextActive]}>
+                        {suggested ? 'Suggested • ' : ''}{family.name}
+                      </Text>
+                      <Text style={styles.familyOptionSubText}>{family.category} • {family.count} existing item{family.count === 1 ? '' : 's'}</Text>
+                    </TouchableOpacity>
+                  );
+                })}
+              </ScrollView>
+            </View>
+          ) : null}
 
           <Text style={styles.label}>2. Material Name:</Text>
           <TextInput
@@ -549,14 +608,45 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
           </TouchableOpacity>
           {!skipVariantSelection ? (
             <>
-              <TextInput
-                style={styles.input}
-                value={size}
-                onChangeText={setSize}
-                placeholder='e.g.: 7/32", 1/8", 3/4", Black, Red, SDS 1/4 x 6'
-                placeholderTextColor="#99a"
-              />
-              <Text style={styles.helperText}>This is the new selectable option that will appear inside the family.</Text>
+              <TouchableOpacity style={styles.checkboxRow} onPress={() => setBatchVariantMode((value) => !value)}>
+                <Text style={styles.checkboxBox}>{batchVariantMode ? '☑' : '☐'}</Text>
+                <View style={{ flex: 1 }}>
+                  <Text style={styles.familyOptionText}>Add several variants at once</Text>
+                  <Text style={styles.familyOptionSubText}>Example: Myers Hub with 1/2, 3/4, 1, 1 1/4, 1 1/2.</Text>
+                </View>
+              </TouchableOpacity>
+
+              {batchVariantMode ? (
+                <>
+                  <View style={styles.optionContainerCompact}>
+                    {['sizes', 'colors', 'text'].map((type) => (
+                      <TouchableOpacity key={type} style={[styles.optionButtonCompact, batchVariantType === type && styles.optionButtonActive]} onPress={() => setBatchVariantType(type)}>
+                        <Text style={[styles.optionText, batchVariantType === type && styles.optionTextActive]}>{type.toUpperCase()}</Text>
+                      </TouchableOpacity>
+                    ))}
+                  </View>
+                  <TextInput
+                    style={[styles.input, styles.descriptionInput]}
+                    value={batchVariantText}
+                    onChangeText={setBatchVariantText}
+                    placeholder='Separate with commas: 1/2, 3/4, 1, 1 1/4, 1 1/2, 2'
+                    placeholderTextColor="#99a"
+                    multiline
+                  />
+                  <Text style={styles.helperText}>Each comma-separated value will become one material inside the same family.</Text>
+                </>
+              ) : (
+                <>
+                  <TextInput
+                    style={styles.input}
+                    value={size}
+                    onChangeText={setSize}
+                    placeholder='e.g.: 7/32", 1/8", 3/4", Black, Red, SDS 1/4 x 6'
+                    placeholderTextColor="#99a"
+                  />
+                  <Text style={styles.helperText}>This is the new selectable option that will appear inside the family.</Text>
+                </>
+              )}
             </>
           ) : (
             <Text style={styles.helperText}>The material will appear inside its family by name instead of size or color.</Text>
@@ -564,7 +654,12 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
 
           <View style={styles.previewCard}>
             <Text style={styles.previewLabel}>Catalog Display Preview</Text>
-            <Text style={styles.previewText}>{getDisplayName()}</Text>
+            <View style={{ flexDirection: 'row', alignItems: 'center', marginTop: 4 }}>
+              {!skipVariantSelection && getPreviewColorCode() ? (
+                <View style={[styles.previewColorDot, { backgroundColor: getPreviewColorCode() }]} />
+              ) : null}
+              <Text style={[styles.previewText, { marginTop: 0 }]}>{getDisplayName()}</Text>
+            </View>
             <Text style={styles.familyOptionSubText}>Family: {resolvedFamilyName() || 'Not selected yet'}</Text>
           </View>
 
@@ -655,16 +750,6 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
             </View>
           ) : null}
 
-          <Text style={styles.label}>7. Catalog Image (Optional):</Text>
-          <View style={styles.imageCard}>
-            {imageUri ? <Image source={{ uri: imageUri }} style={styles.previewImage} resizeMode="contain" /> : <View style={styles.emptyImageBox}><Text style={styles.emptyImageText}>No image selected</Text></View>}
-            <View style={styles.imageButtonRow}>
-              <TouchableOpacity style={styles.imageButton} onPress={pickImageFromLibrary}><Text style={styles.imageButtonText}>📁 Upload</Text></TouchableOpacity>
-              <TouchableOpacity style={styles.imageButton} onPress={takePhotoWithCamera}><Text style={styles.imageButtonText}>📷 Camera</Text></TouchableOpacity>
-            </View>
-            {imageUri ? <TouchableOpacity style={styles.removeImageButton} onPress={() => setImageUri('')}><Text style={styles.removeImageText}>Remove Image</Text></TouchableOpacity> : null}
-          </View>
-
           <Text style={styles.label}>7. Photo Options:</Text>
           <View style={styles.familyPickerCard}>
             <TouchableOpacity
@@ -727,16 +812,22 @@ const styles = StyleSheet.create({
   title: { fontSize: 16, fontWeight: '900', color: '#64ffda', textAlign: 'center', marginBottom: 20, letterSpacing: 1 },
   label: { color: '#e6f1ff', fontWeight: 'bold', marginBottom: 6, fontSize: 13, textTransform: 'uppercase' },
   helperText: { color: '#8892b0', fontSize: 12, marginTop: -8, marginBottom: 15 },
+  helperTextNoMargin: { color: '#8892b0', fontSize: 12, marginTop: 2 },
+  sectionHeaderButton: { flexDirection: 'row', alignItems: 'center', backgroundColor: '#112240', borderRadius: 10, borderWidth: 1, borderColor: '#64ffda55', padding: 12, marginBottom: 12 },
+  sectionHeaderIcon: { color: '#64ffda', fontSize: 16, fontWeight: '900' },
   descriptionInput: { minHeight: 85, textAlignVertical: 'top' },
   input: { backgroundColor: '#172a45', padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#303c55', color: '#e6f1ff', fontSize: 15, marginBottom: 15 },
   optionContainer: { flexDirection: 'row', flexWrap: 'wrap', marginBottom: 20, justifyContent: 'space-between' },
+  optionContainerCompact: { flexDirection: 'row', flexWrap: 'wrap', marginBottom: 10, gap: 8 },
   optionButton: { backgroundColor: '#112240', paddingVertical: 10, paddingHorizontal: 6, borderRadius: 8, borderWidth: 1, borderColor: '#233554', marginBottom: 10, width: '48%', alignItems: 'center' },
+  optionButtonCompact: { backgroundColor: '#112240', paddingVertical: 10, paddingHorizontal: 12, borderRadius: 8, borderWidth: 1, borderColor: '#233554', alignItems: 'center' },
   optionButtonActive: { backgroundColor: '#0275d8', borderColor: '#64ffda' },
   optionText: { color: '#8892b0', fontWeight: 'bold', fontSize: 10, textAlign: 'center' },
   optionTextActive: { color: '#fff' },
   previewCard: { backgroundColor: '#112240', borderRadius: 10, borderWidth: 1, borderColor: '#64ffda55', padding: 12, marginBottom: 18 },
   previewLabel: { color: '#8892b0', fontSize: 11, fontWeight: 'bold', textTransform: 'uppercase' },
   previewText: { color: '#64ffda', fontSize: 16, fontWeight: '900', marginTop: 4 },
+  previewColorDot: { width: 14, height: 14, borderRadius: 7, marginRight: 10, borderWidth: 1, borderColor: '#fff' },
   imageCard: { backgroundColor: '#112240', borderRadius: 12, borderWidth: 1, borderColor: '#233554', padding: 12, marginBottom: 22 },
   previewImage: { width: '100%', height: 210, borderRadius: 10, backgroundColor: '#172a45', marginBottom: 12 },
   emptyImageBox: { width: '100%', height: 160, borderRadius: 10, borderWidth: 1, borderStyle: 'dashed', borderColor: '#64ffda88', justifyContent: 'center', alignItems: 'center', marginBottom: 12 },

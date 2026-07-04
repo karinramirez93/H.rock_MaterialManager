@@ -114,14 +114,40 @@ const getSortableBaseName = (material) => {
 const CONDUCTOR_COLOR_NAMES = ['Black', 'Red', 'Blue', 'Orange', 'Brown', 'Yellow', 'White', 'Green', 'Gray', 'Grey', 'Purple'];
 
 const getConductorColor = (material) => {
-  if (String(material?.category || '').toLowerCase() !== 'conductors') return '';
+  const materialCategory = String(material?.category || '').toLowerCase();
+  const variantType = String(material?.variantType || '').toLowerCase();
   const materialName = String(material?.name || '').trim();
-  const matchingColor = CONDUCTOR_COLOR_NAMES.find((color) => {
-    const colorPattern = new RegExp(`\\b${color}\\b$`, 'i');
-    return colorPattern.test(materialName);
-  });
-  if (!matchingColor) return '';
-  return matchingColor === 'Grey' ? 'Gray' : matchingColor;
+
+  const looksLikeWire =
+    materialCategory === 'conductors' ||
+    materialCategory === 'wire' ||
+    materialName.toLowerCase().includes('wire') ||
+    variantType === 'colors';
+
+  if (!looksLikeWire) return '';
+
+  const candidateFields = [
+    material?.color,
+    material?.variant,
+    material?.size,
+    material?.name
+  ];
+
+  for (const candidate of candidateFields) {
+    const candidateText = String(candidate || '').trim();
+    if (!candidateText) continue;
+
+    const matchingColor = CONDUCTOR_COLOR_NAMES.find((color) => {
+      const colorPattern = new RegExp(`\\b${color}\\b`, 'i');
+      return colorPattern.test(candidateText);
+    });
+
+    if (matchingColor) {
+      return matchingColor === 'Grey' ? 'Gray' : matchingColor;
+    }
+  }
+
+  return '';
 };
 
 const getConductorFamilyBaseName = (material) => {

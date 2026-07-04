@@ -300,6 +300,9 @@ const sortCatalogForDisplay = (items, sortMode = 'name') => {
 // Returns a small visual color dot for common conductor colors.
 // This is only a UI helper for the selected-material list inside the modal.
 const getMaterialColorCode = (material) => {
+  const colorName = getConductorColor(material);
+  if (colorName) return getColorCodeByName(colorName);
+
   const name = getMaterialDisplayName(material).toLowerCase();
   if (name.includes('black')) return '#000000';
   if (name.includes('blue')) return '#1266d6';
@@ -318,16 +321,59 @@ const getMaterialColorCode = (material) => {
 const CONDUCTOR_COLOR_NAMES = ['Black', 'Red', 'Blue', 'Orange', 'Brown', 'Yellow', 'White', 'Green', 'Gray', 'Grey', 'Purple'];
 
 // Detects whether a material is a conductor color variant.
-// Example: THHN Wire #12 Black -> color Black.
+//
+// This function intentionally checks more than only the material name.
+// Older materials usually have the color at the end of the name:
+//   THHN Wire #12 Black
+// Batch-created materials may store the color in a dedicated field or in the
+// custom variant/size value instead:
+//   name: THHN Wire #12, color: Black
+//   name: THHN Wire #12, variant: Black
+//   name: THHN Wire #12, size: Black
+//
+// Returning a normalized color here allows every wire family to keep the same
+// color-badge UI, even when the variants were created in bulk.
 const getConductorColor = (material) => {
-  if (String(material?.category || '').toLowerCase() !== 'conductors') return '';
-  const materialName = String(material?.name || '').trim();
-  const matchingColor = CONDUCTOR_COLOR_NAMES.find((color) => {
-    const colorPattern = new RegExp(`\\b${color}\\b$`, 'i');
-    return colorPattern.test(materialName);
-  });
-  if (!matchingColor) return '';
-  return matchingColor === 'Grey' ? 'Gray' : matchingColor;
+  const materialCategory = String(material?.category || '').toLowerCase();
+  const familyText = String(material?.familyName || material?.name || '').toLowerCase();
+  const variantType = String(material?.variantType || '').toLowerCase();
+
+  const looksLikeWire =
+    materialCategory === 'conductors' ||
+    materialCategory === 'wire' ||
+    familyText.includes('thhn') ||
+    familyText.includes('xhhw') ||
+    familyText.includes('wire') ||
+    familyText.includes('cable') ||
+    variantType === 'colors';
+
+  if (!looksLikeWire) return '';
+
+  const candidateFields = [
+    material?.color,
+    material?.colour,
+    material?.variant,
+    material?.variantName,
+    material?.option,
+    material?.size,
+    material?.name
+  ];
+
+  for (const candidate of candidateFields) {
+    const candidateText = String(candidate || '').trim();
+    if (!candidateText) continue;
+
+    const matchingColor = CONDUCTOR_COLOR_NAMES.find((color) => {
+      const colorPattern = new RegExp(`\\b${color}\\b`, 'i');
+      return colorPattern.test(candidateText);
+    });
+
+    if (matchingColor) {
+      return matchingColor === 'Grey' ? 'Gray' : matchingColor;
+    }
+  }
+
+  return '';
 };
 
 // Removes the trailing conductor color from a wire material name.
@@ -482,7 +528,7 @@ const buildCatalogDisplayItems = (items) => {
   const displayItems = Array.from(familyMap.entries()).map(([familyKey, variants]) => {
     const sortedVariants = sortCatalogByNameAndSize(variants);
     const firstVariant = sortedVariants[0] || {};
-    const hasColorVariants = sortedVariants.some((variant) => isConductorColorFamily(variant)) && sortedVariants.length > 1;
+    const hasColorVariants = sortedVariants.some((variant) => isConductorColorFamily(variant) || variant?.variantType === 'colors') && sortedVariants.length > 1;
     const hasSizeVariants = sortedVariants.some((variant) => variant?.size && variant.size !== 'N/A') && sortedVariants.length > 1;
     const isExplicitFamily = Boolean(firstVariant.familyName) && sortedVariants.length > 1;
 
@@ -1476,7 +1522,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
                           );
                         })}
                       </View>
-                    ) : selectedItem?.category === 'Conductors' ? (
+                    ) : selectedItem?.familyMode === 'color' ? (
                       <View style={styles.colorSelectionGrid}>
                         {selectedFamilyVariants.map((variant) => {
                           const variantLabel = getFamilyVariantLabel(variant, 'color');
@@ -1783,8 +1829,8 @@ const styles = StyleSheet.create({
   selectedRowsContainer: { borderWidth: 1, borderColor: '#dbe3ef', borderRadius: 8, overflow: 'hidden', backgroundColor: '#fff' },
   selectedMaterialRow: { minHeight: 48, flexDirection: 'row', alignItems: 'center', paddingHorizontal: 10, paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#e5eaf2' },
   selectedMaterialInfo: { flex: 1 },
-  materialColorDot: { width: 13, height: 13, borderRadius: 7, marginRight: 12, borderWidth: 1, borderColor: '#cbd5e1' },
-  selectedMaterialText: { color: '#111827', fontSize: 13, fontWeight: '800' },
+  materialColorDot: { width: 18, height: 18, borderRadius: 9, marginRight: 12, borderWidth: 1, borderColor: '#cbd5e1' },
+  selectedMaterialText: { color: '#111827', fontSize: 15, fontWeight: '900' },
   selectedMaterialDescription: { color: '#64748b', fontSize: 11, marginTop: 2, lineHeight: 15 },
   removeSelectedButton: { width: 30, height: 30, justifyContent: 'center', alignItems: 'center' },
   removeSelectedText: { color: '#718096', fontSize: 22, fontWeight: '300' },
