@@ -82,7 +82,7 @@ const CATEGORIES_CACHE_KEY = '@material_categories_cache_v1';
 const UNIT_MEASURES_CACHE_KEY = '@material_unit_measures_cache_v1';
 const IMPORTANT_INFO_CACHE_KEY = '@important_info_cache_v1';
 const CATALOG_CACHE_SCHEMA_KEY = '@material_catalog_cache_schema_version';
-const CATALOG_CACHE_SCHEMA_VERSION = 'incremental-sync-storage-url-thumbnail-lazy-cache-v4';
+const CATALOG_CACHE_SCHEMA_VERSION = 'incremental-sync-preserve-individual-images-v5';
 const CATALOG_CLOUD_UPDATED_AT_KEY = '@material_catalog_cloud_updated_at_v1';
 const CATALOG_LAST_INCREMENTAL_SYNC_AT_KEY = '@material_catalog_last_incremental_sync_at_v1';
 const SETTINGS_CLOUD_UPDATED_AT_KEY = '@material_settings_cloud_updated_at_v1';
@@ -148,6 +148,11 @@ const getCurrentAuditUserLabel = async () => {
 
 const ensureSharedDataEditor = async () => {
   await AuthService.ensureCanEditSharedData();
+};
+
+const ensureSharedDataOwner = async () => {
+  const isOwner = await AuthService.isOwner();
+  if (!isOwner) throw new Error('ONLY_OWNER_CAN_RUN_STORAGE_RECOVERY');
 };
 
 const getDefaultAllowedUnitsByCategory = (category) => {
@@ -260,10 +265,22 @@ const ensureDirectoryExists = async (directoryUri) => {
 };
 
 
-const createStorageFileName = ({ folder, fileKey, extension = 'jpg' }) => {
-  const safeKey = sanitizeImageFileName(fileKey || `image-${Date.now()}`);
-  return `${folder}/${safeKey}-${Date.now()}.${extension}`;
+const sanitizeStoragePathSegment = (value) => sanitizeImageFileName(value || 'image');
+
+const createStableStorageFilePath = ({ folder, fileKey, extension = 'jpg' }) => {
+  const safeFolder = String(folder || '').split('/').filter(Boolean).map(sanitizeStoragePathSegment).join('/');
+  const safeKeyPath = String(fileKey || 'image')
+    .split('/')
+    .filter(Boolean)
+    .map(sanitizeStoragePathSegment)
+    .join('/');
+
+  return `${safeFolder}/${safeKeyPath}.${extension}`;
 };
+
+const createMaterialImageStorageKey = (materialId) => `materials/${materialId || 'unknown-material'}/thumbnail`;
+const createFamilyCoverStorageKey = (familyNameOrId) => `families/${familyNameOrId || 'unknown-family'}/cover`;
+const createImportantInfoStorageKey = (infoId) => `${infoId || 'unknown-info'}/image`;
 
 /**
  * Uploads an image data URI to Firebase Storage and returns a small metadata object.
@@ -314,13 +331,13 @@ const uploadDataUriToFirebaseStorage = async ({ dataUri, folder, fileKey }) => {
   if (!idToken) throw new Error('Firebase Storage upload requires a signed-in user.');
 
   const extension = getImageExtensionFromDataUri(dataUri);
-  const storagePath = createStorageFileName({ folder, fileKey, extension });
+  const storagePath = createStableStorageFilePath({ folder, fileKey, extension });
   const contentType = getContentTypeFromDataUri(dataUri);
   const temporaryFileUri = await writeDataUriToTemporaryFile({ dataUri, fileKey: `${fileKey}-upload` });
 
   const uploadUrl = `https://firebasestorage.googleapis.com/v0/b/${FIREBASE_CONFIG.storageBucket}/o?uploadType=media&name=${encodeURIComponent(storagePath)}`;
 
-  const response = await FileSystem.uploadAsync(uploadUrl, temporaryFileUri, {
+  const uploadRequest = async () => FileSystem.uploadAsync(uploadUrl, temporaryFileUri, {
     httpMethod: 'POST',
     // Use the legacy FileSystem API because uploadAsync was moved out of the main
     // expo-file-system export in newer Expo versions.
@@ -331,6 +348,12 @@ const uploadDataUriToFirebaseStorage = async ({ dataUri, folder, fileKey }) => {
       'Cache-Control': 'public,max-age=31536000'
     }
   });
+
+  let response = await uploadRequest();
+  if (response.status === 429) {
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    response = await uploadRequest();
+  }
 
   if (response.status < 200 || response.status >= 300) {
     throw new Error(`Firebase Storage upload failed (${response.status}): ${response.body || 'No response body'}`);
@@ -444,30 +467,36 @@ const uploadCatalogImageAsThumbnail = async ({ imageUri, folder, fileKey }) => {
   return uploadDataUriToFirebaseStorage({ dataUri: thumbnailDataUri, folder, fileKey });
 };
 
-const saveCatalogImagesToFirebaseStorage = async (material) => {
+const saveCatalogImagesToFirebaseStorage = async (material, uploadCache = new Map()) => {
   const normalized = normalizeMaterial(material);
   let imageUri = normalized.imageUri || '';
   let imageStoragePath = normalized.imageStoragePath || '';
   let groupCoverUri = normalized.groupCoverUri || '';
   let groupCoverStoragePath = normalized.groupCoverStoragePath || '';
 
+  const uploadOnce = async ({ sourceUri, folder, fileKey }) => {
+    const cacheKey = `${folder}/${fileKey}/${String(sourceUri).slice(0, 120)}`;
+    if (uploadCache.has(cacheKey)) return uploadCache.get(cacheKey);
+    const uploadPromise = uploadCatalogImageAsThumbnail({ imageUri: sourceUri, folder, fileKey });
+    uploadCache.set(cacheKey, uploadPromise);
+    return uploadPromise;
+  };
+
   if (imageUri && (isInlineImageDataUri(imageUri) || String(imageUri).startsWith('file://') || String(imageUri).startsWith('content://'))) {
-    if (imageStoragePath) await deleteFirebaseStorageFileIfPossible(imageStoragePath);
-    const uploaded = await uploadCatalogImageAsThumbnail({
-      imageUri,
+    const uploaded = await uploadOnce({
+      sourceUri: imageUri,
       folder: CATALOG_STORAGE_FOLDER,
-      fileKey: `${normalized.id}-thumbnail`
+      fileKey: createMaterialImageStorageKey(normalized.id)
     });
     imageUri = uploaded.imageUri;
     imageStoragePath = uploaded.storagePath;
   }
 
   if (groupCoverUri && (isInlineImageDataUri(groupCoverUri) || String(groupCoverUri).startsWith('file://') || String(groupCoverUri).startsWith('content://'))) {
-    if (groupCoverStoragePath) await deleteFirebaseStorageFileIfPossible(groupCoverStoragePath);
-    const uploaded = await uploadCatalogImageAsThumbnail({
-      imageUri: groupCoverUri,
+    const uploaded = await uploadOnce({
+      sourceUri: groupCoverUri,
       folder: CATALOG_STORAGE_FOLDER,
-      fileKey: `${normalized.familyName || normalized.id}-cover-thumbnail`
+      fileKey: createFamilyCoverStorageKey(normalized.familyName || normalized.id)
     });
     groupCoverUri = uploaded.imageUri;
     groupCoverStoragePath = uploaded.storagePath;
@@ -493,7 +522,7 @@ const saveImportantInfoImageToFirebaseStorage = async (item) => {
   const uploaded = await uploadDataUriToFirebaseStorage({
     dataUri: normalized.imageUri,
     folder: IMPORTANT_INFO_STORAGE_FOLDER,
-    fileKey: `${normalized.id}-full`
+    fileKey: createImportantInfoStorageKey(normalized.id)
   });
 
   return {
@@ -870,30 +899,20 @@ const getSQLiteDatabase = async () => {
   return database;
 };
 
-// Catalog photos can be very large. SQLite should not store those images
-// directly. The local cache keeps only one lightweight image reference per
-// material family. Remote images are not downloaded here; they are downloaded
-// lazily by the UI only when the row becomes visible. This keeps Firebase usage
-// low and prevents SQLITE_FULL/CursorWindow errors.
-const getMaterialFamilyKeyForCache = (material) => `${String(material?.category || 'Others').toLowerCase()}::${getSortableBaseName(material)}`;
-
+// Catalog photos can be very large when they are inline base64. SQLite should
+// never store base64 image payloads, but it is safe and necessary to store
+// lightweight Firebase Storage URLs/paths for every material. Earlier builds
+// kept only the first image per family in the local cache. That saved a tiny
+// amount of metadata, but it broke list-style families such as Bandsaw Blades:
+// the individual material photo disappeared after saving/reloading because the
+// cache blanked out imageUri for the second/third variant. Keep all remote/file
+// references and only convert inline images to local files before SQLite writes.
 const createFamilySharedImageCatalogCache = async (catalog) => {
-  const familyImageAlreadyCached = new Set();
   const preparedCatalog = [];
 
   for (const material of catalog || []) {
     const normalized = normalizeMaterial(material);
-    const familyKey = getMaterialFamilyKeyForCache(normalized);
-    const hasImage = Boolean(normalized.imageUri);
-
-    if (hasImage && familyImageAlreadyCached.has(familyKey)) {
-      preparedCatalog.push({ ...normalized, imageUri: '' });
-      continue;
-    }
-
-    const preparedMaterial = await prepareMaterialForLocalCache(normalized);
-    if (hasImage) familyImageAlreadyCached.add(familyKey);
-    preparedCatalog.push(preparedMaterial);
+    preparedCatalog.push(await prepareMaterialForLocalCache(normalized));
   }
 
   return preparedCatalog;
@@ -1100,6 +1119,8 @@ const clearDirectoryIfPossible = async (directoryUri) => {
     console.warn('StorageService Warning (clear image cache skipped):', error);
   }
 };
+
+
 
 export const StorageService = {
   /**
@@ -1376,7 +1397,7 @@ export const StorageService = {
         const uploaded = await uploadCatalogImageAsThumbnail({
           imageUri: normalized.imageUri,
           folder: CATALOG_STORAGE_FOLDER,
-          fileKey: `${normalized.id}-thumbnail`
+          fileKey: createMaterialImageStorageKey(normalized.id)
         });
         updatedMaterial.imageUri = uploaded.imageUri;
         updatedMaterial.imageStoragePath = uploaded.storagePath;
@@ -1386,7 +1407,7 @@ export const StorageService = {
         const uploaded = await uploadCatalogImageAsThumbnail({
           imageUri: normalized.groupCoverUri,
           folder: CATALOG_STORAGE_FOLDER,
-          fileKey: `${normalized.familyName || normalized.id}-cover-thumbnail`
+          fileKey: createFamilyCoverStorageKey(normalized.familyName || normalized.id)
         });
         updatedMaterial.groupCoverUri = uploaded.imageUri;
         updatedMaterial.groupCoverStoragePath = uploaded.storagePath;
@@ -1496,23 +1517,34 @@ export const StorageService = {
       let normalizedUpdates = materialVariants.map((variant) => {
         const previousVariant = existingByIdForVersion.get(variant.id) || {};
         return normalizeMaterial({
-        ...variant,
-        id: variant.id,
-        name: (variant.name || '').trim(),
-        category: variant.category || 'Others',
-        size: variant.size || 'N/A',
-        imageUri: variant.imageUri || '',
-        description: variant.description || '',
-        allowedUnits: normalizeAllowedUnits(variant.allowedUnits, variant.category),
-        createdAt: variant.createdAt || now,
-        createdBy: variant.createdBy || userLabel,
-        updatedAt: now,
-        version: Number(previousVariant.version || variant.version || 1) + 1,
-        updatedBy: userLabel
-      });
+          ...previousVariant,
+          ...variant,
+          id: variant.id,
+          name: (variant.name || previousVariant.name || '').trim(),
+          category: variant.category || previousVariant.category || 'Others',
+          size: variant.size || previousVariant.size || 'N/A',
+          imageUri: variant.imageUri !== undefined ? variant.imageUri : (previousVariant.imageUri || ''),
+          imageStoragePath: variant.imageStoragePath !== undefined ? variant.imageStoragePath : (previousVariant.imageStoragePath || ''),
+          groupCoverUri: variant.groupCoverUri !== undefined ? variant.groupCoverUri : (previousVariant.groupCoverUri || ''),
+          groupCoverStoragePath: variant.groupCoverStoragePath !== undefined ? variant.groupCoverStoragePath : (previousVariant.groupCoverStoragePath || ''),
+          description: variant.description !== undefined ? variant.description : (previousVariant.description || ''),
+          allowedUnits: normalizeAllowedUnits(variant.allowedUnits || previousVariant.allowedUnits, variant.category || previousVariant.category),
+          createdAt: previousVariant.createdAt || variant.createdAt || now,
+          createdBy: previousVariant.createdBy || variant.createdBy || userLabel,
+          updatedAt: now,
+          version: Number(previousVariant.version || variant.version || 1) + 1,
+          updatedBy: userLabel
+        });
       });
 
-      normalizedUpdates = await Promise.all(normalizedUpdates.map(saveCatalogImagesToFirebaseStorage));
+      {
+        const familyUploadCache = new Map();
+        const preparedUpdates = [];
+        for (const item of normalizedUpdates) {
+          preparedUpdates.push(await saveCatalogImagesToFirebaseStorage(item, familyUploadCache));
+        }
+        normalizedUpdates = preparedUpdates;
+      }
 
       const idsBeingUpdated = new Set(normalizedUpdates.map((item) => item.id));
       const duplicate = existingCatalog.some((existingItem) => {
@@ -1600,16 +1632,20 @@ export const StorageService = {
       const userLabel = await getCurrentAuditUserLabel();
       const existingMaterial = existingCatalog.find((item) => item.id === materialId) || {};
       let updatedMaterial = normalizeMaterial({
+        ...existingMaterial,
         ...materialChanges,
         id: materialId,
         name: cleanName,
-        category: materialChanges.category || 'Others',
-        size: materialChanges.size || 'N/A',
-        imageUri: materialChanges.imageUri || '',
-        description: materialChanges.description || '',
-        allowedUnits: normalizeAllowedUnits(materialChanges.allowedUnits, materialChanges.category),
-        createdAt: materialChanges.createdAt || new Date().toISOString(),
-        createdBy: materialChanges.createdBy || userLabel,
+        category: materialChanges.category || existingMaterial.category || 'Others',
+        size: materialChanges.size || existingMaterial.size || 'N/A',
+        imageUri: materialChanges.imageUri !== undefined ? materialChanges.imageUri : (existingMaterial.imageUri || ''),
+        imageStoragePath: materialChanges.imageStoragePath !== undefined ? materialChanges.imageStoragePath : (existingMaterial.imageStoragePath || ''),
+        groupCoverUri: materialChanges.groupCoverUri !== undefined ? materialChanges.groupCoverUri : (existingMaterial.groupCoverUri || ''),
+        groupCoverStoragePath: materialChanges.groupCoverStoragePath !== undefined ? materialChanges.groupCoverStoragePath : (existingMaterial.groupCoverStoragePath || ''),
+        description: materialChanges.description !== undefined ? materialChanges.description : (existingMaterial.description || ''),
+        allowedUnits: normalizeAllowedUnits(materialChanges.allowedUnits || existingMaterial.allowedUnits, materialChanges.category || existingMaterial.category),
+        createdAt: existingMaterial.createdAt || materialChanges.createdAt || new Date().toISOString(),
+        createdBy: existingMaterial.createdBy || materialChanges.createdBy || userLabel,
         updatedAt: new Date().toISOString(),
         version: Number(existingMaterial.version || materialChanges.version || 1) + 1,
         updatedBy: userLabel
@@ -1681,7 +1717,7 @@ export const StorageService = {
         const uploadResult = await uploadCatalogImageAsThumbnail({
           imageUri: cleanImageUri,
           folder: CATALOG_STORAGE_FOLDER,
-          fileKey: `${materialId}-thumbnail`
+          fileKey: createMaterialImageStorageKey(materialId)
         });
         finalImageUri = uploadResult.imageUri || cleanImageUri;
         finalImageStoragePath = uploadResult.storagePath || '';

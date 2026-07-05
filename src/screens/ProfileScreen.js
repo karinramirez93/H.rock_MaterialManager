@@ -5,7 +5,7 @@
  * that will be used for Created By and audit fields.
  */
 import React, { useEffect, useState } from 'react';
-import { Alert, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
+import { Alert, ScrollView, StyleSheet, Text, TextInput, TouchableOpacity, View } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { AuthService } from '../database/authService';
 
@@ -37,7 +37,7 @@ export default function ProfileScreen({ onSignOut }) {
 
   return (
     <SafeAreaView style={styles.container} edges={['left', 'right', 'bottom']}>
-      <View style={styles.content}>
+      <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
         <Text style={styles.title}>USER PROFILE</Text>
 
         {user?.isGuest ? (
@@ -75,14 +75,14 @@ export default function ProfileScreen({ onSignOut }) {
         <TouchableOpacity style={styles.signOutButton} onPress={handleSignOut}>
           <Text style={styles.buttonText}>{user?.isGuest ? 'EXIT GUEST MODE' : 'SIGN OUT'}</Text>
         </TouchableOpacity>
-      </View>
+      </ScrollView>
     </SafeAreaView>
   );
 }
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0a192f' },
-  content: { padding: 20 },
+  content: { padding: 20, paddingBottom: 40 },
   title: { color: '#64ffda', fontSize: 18, fontWeight: '900', textAlign: 'center', marginBottom: 20 },
   guestCard: { backgroundColor: '#112240', padding: 14, borderRadius: 10, borderWidth: 1, borderColor: '#64ffda', marginBottom: 15 },
   guestTitle: { color: '#64ffda', fontWeight: 'bold', marginBottom: 6 },

@@ -670,6 +670,8 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
       size: variant.size && variant.size !== 'N/A' ? variant.size : '',
       description: variant.description || '',
       forceShowDescription: variant.forceShowDescription === true,
+      imageUri: variant.imageUri || '',
+      imageStoragePath: variant.imageStoragePath || '',
       original: variant
     })));
     setHardDeleteConfirmed(false);
@@ -700,21 +702,32 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     setActiveVariantDescription(draft.description || '');
     setActiveVariantForceShowDescription(draft.forceShowDescription === true);
     const variantImg = draft.imageUri !== undefined ? draft.imageUri : (draft.original?.imageUri || '');
+    const variantStoragePath = draft.imageStoragePath || draft.original?.imageStoragePath || '';
     setActiveVariantImageUri(variantImg);
-    setShowIndividualImagePicker(Boolean(variantImg));
+    setShowIndividualImagePicker(Boolean(variantImg || variantStoragePath));
     setVariantEditorVisible(true);
   };
 
   const saveVariantEditor = () => {
     if (!activeVariantDraftId) return;
-    setVariantDrafts((current) => current.map((draft) => draft.id === activeVariantDraftId ? {
-      ...draft,
-      name: activeVariantName.trim(),
-      size: activeVariantSize.trim(),
-      description: activeVariantDescription.trim(),
-      forceShowDescription: activeVariantForceShowDescription,
-      imageUri: showIndividualImagePicker ? activeVariantImageUri : ''
-    } : draft));
+    setVariantDrafts((current) => current.map((draft) => {
+      if (draft.id !== activeVariantDraftId) return draft;
+
+      const nextImageUri = showIndividualImagePicker ? (activeVariantImageUri || '') : '';
+      const previousImageUri = draft.imageUri !== undefined ? draft.imageUri : (draft.original?.imageUri || '');
+      const previousStoragePath = draft.imageStoragePath || draft.original?.imageStoragePath || '';
+      const imageWasChanged = nextImageUri !== previousImageUri;
+
+      return {
+        ...draft,
+        name: activeVariantName.trim(),
+        size: activeVariantSize.trim(),
+        description: activeVariantDescription.trim(),
+        forceShowDescription: activeVariantForceShowDescription,
+        imageUri: nextImageUri,
+        imageStoragePath: showIndividualImagePicker && !imageWasChanged ? previousStoragePath : ''
+      };
+    }));
     setVariantEditorVisible(false);
   };
 
@@ -777,6 +790,9 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
         const resolvedVariantImageUri = draft.imageUri !== undefined
           ? draft.imageUri
           : (variant.imageUri || '');
+        const resolvedVariantImageStoragePath = draft.imageStoragePath !== undefined
+          ? draft.imageStoragePath
+          : (variant.imageStoragePath || '');
 
         return {
           ...variant,
@@ -790,8 +806,10 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
           familyDisplayMode: editFamilyDisplayMode,
           allowedUnits,
           imageUri: resolvedVariantImageUri,
+          imageStoragePath: resolvedVariantImageStoragePath,
           // Store the Group Cover URI in all variants only if the picker is enabled
-          groupCoverUri: showGroupCoverPicker ? (groupCoverImageUri || '') : ''
+          groupCoverUri: showGroupCoverPicker ? (groupCoverImageUri || '') : '',
+          groupCoverStoragePath: showGroupCoverPicker ? (variant.groupCoverStoragePath || '') : ''
         };
       });
 
@@ -1136,6 +1154,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                         <Image
                           source={{ uri: draft.imageUri || draft.original.imageUri }}
                           style={styles.variantThumbnail}
+                          resizeMode="contain"
                         />
                       ) : null}
                       <View style={{ flex: 1 }}>
