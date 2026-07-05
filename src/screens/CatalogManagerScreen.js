@@ -1036,7 +1036,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
       <Modal visible={modalVisible} transparent animationType="fade" onRequestClose={() => setModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
-            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={20}>
+            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={0}>
             <View style={styles.modalContent}>
               <TouchableOpacity style={styles.closeIconButton} onPress={() => setModalVisible(false)}>
                 <Text style={styles.closeIconText}>✕</Text>
@@ -1217,53 +1217,60 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
       <Modal visible={variantEditorVisible} transparent animationType="slide" onRequestClose={() => setVariantEditorVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
-            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={20}>
+            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={0}>
               <View style={styles.variantEditorModal}>
                 <TouchableOpacity style={styles.closeIconButton} onPress={() => setVariantEditorVisible(false)}>
                   <Text style={styles.closeIconText}>✕</Text>
                 </TouchableOpacity>
-                <Text style={styles.modalTitle}>EDIT MATERIAL DETAILS</Text>
-
-                <TouchableOpacity
-                  style={[styles.checkboxRow, showIndividualImagePicker && styles.checkboxRowActive]}
-                  onPress={() => setShowIndividualImagePicker(!showIndividualImagePicker)}
+                <ScrollView
+                  showsVerticalScrollIndicator={false}
+                  keyboardShouldPersistTaps="handled"
+                  keyboardDismissMode="interactive"
+                  contentContainerStyle={styles.variantEditorScrollContent}
                 >
-                  <Text style={styles.checkboxBox}>{showIndividualImagePicker ? '☑' : '☐'}</Text>
-                  <Text style={[styles.familyOptionText, showIndividualImagePicker && styles.familyOptionTextActive]}>Enable Individual Photo</Text>
-                </TouchableOpacity>
+                  <Text style={styles.modalTitle}>EDIT MATERIAL DETAILS</Text>
 
-                {showIndividualImagePicker && (
-                  <>
-                    <Text style={styles.imageSectionTitle}>INDIVIDUAL PHOTO</Text>
-                    <Text style={styles.imageSectionSub}>This photo only shows up when choosing this specific material.</Text>
+                  <TouchableOpacity
+                    style={[styles.checkboxRow, showIndividualImagePicker && styles.checkboxRowActive]}
+                    onPress={() => setShowIndividualImagePicker(!showIndividualImagePicker)}
+                  >
+                    <Text style={styles.checkboxBox}>{showIndividualImagePicker ? '☑' : '☐'}</Text>
+                    <Text style={[styles.familyOptionText, showIndividualImagePicker && styles.familyOptionTextActive]}>Enable Individual Photo</Text>
+                  </TouchableOpacity>
 
-                    {activeVariantImageUri ? (
-                      <TouchableOpacity onPress={() => openZoom(activeVariantImageUri)}>
-                        <Image source={{ uri: activeVariantImageUri }} style={styles.modalImage} resizeMode="contain" />
-                      </TouchableOpacity>
-                    ) : <View style={styles.modalImagePlaceholder}><Text style={styles.modalImagePlaceholderText}>No Individual Photo</Text></View>}
-                    <View style={styles.imageButtonRow}>
-                      <TouchableOpacity style={styles.imageButton} onPress={pickVariantImage}><Text style={styles.imageButtonText}>📁 Replace</Text></TouchableOpacity>
-                      <TouchableOpacity style={styles.imageButton} onPress={takeVariantPhoto}><Text style={styles.imageButtonText}>📷 Camera</Text></TouchableOpacity>
-                    </View>
-                    {activeVariantImageUri ? <TouchableOpacity style={styles.removeImageButton} onPress={() => setActiveVariantImageUri('')}><Text style={styles.removeImageText}>Remove Photo</Text></TouchableOpacity> : null}
-                  </>
-                )}
+                  {showIndividualImagePicker && (
+                    <>
+                      <Text style={styles.imageSectionTitle}>INDIVIDUAL PHOTO</Text>
+                      <Text style={styles.imageSectionSub}>This photo only shows up when choosing this specific material.</Text>
 
-                <Text style={styles.inputLabel}>Material Name:</Text>
-                <TextInput style={styles.modalInput} value={activeVariantName} onChangeText={setActiveVariantName} placeholder="Material name" placeholderTextColor="#777" />
-                <Text style={styles.inputLabel}>Size / Variant:</Text>
-                <TextInput style={styles.modalInput} value={activeVariantSize} onChangeText={setActiveVariantSize} placeholder="e.g.: 3/4, #12 Black, 5/16" placeholderTextColor="#777" />
-                <Text style={styles.inputLabel}>Description:</Text>
-                <TextInput style={[styles.modalInput, styles.descriptionInput]} value={activeVariantDescription} onChangeText={setActiveVariantDescription} multiline placeholder="Description for this material" placeholderTextColor="#777" />
-                <TouchableOpacity style={styles.hardDeleteConfirmRow} onPress={() => setActiveVariantForceShowDescription((v) => !v)}>
-                  <Text style={[styles.hardDeleteCheckbox, { color: '#0a192f' }]}>{activeVariantForceShowDescription ? '☑' : '☐'}</Text>
-                  <Text style={[styles.hardDeleteWarning, { color: '#0a192f' }]}>Always show description during selection</Text>
-                </TouchableOpacity>
-                <View style={styles.modalActions}>
-                  <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#8892b0' }]} onPress={() => setVariantEditorVisible(false)}><Text style={styles.btnText}>Cancel</Text></TouchableOpacity>
-                  <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#0275d8' }]} onPress={saveVariantEditor}><Text style={styles.btnText}>Save Item</Text></TouchableOpacity>
-                </View>
+                      {activeVariantImageUri ? (
+                        <TouchableOpacity onPress={() => openZoom(activeVariantImageUri)}>
+                          <Image source={{ uri: activeVariantImageUri }} style={styles.modalImage} resizeMode="contain" />
+                        </TouchableOpacity>
+                      ) : <View style={styles.modalImagePlaceholder}><Text style={styles.modalImagePlaceholderText}>No Individual Photo</Text></View>}
+                      <View style={styles.imageButtonRow}>
+                        <TouchableOpacity style={styles.imageButton} onPress={pickVariantImage}><Text style={styles.imageButtonText}>📁 Replace</Text></TouchableOpacity>
+                        <TouchableOpacity style={styles.imageButton} onPress={takeVariantPhoto}><Text style={styles.imageButtonText}>📷 Camera</Text></TouchableOpacity>
+                      </View>
+                      {activeVariantImageUri ? <TouchableOpacity style={styles.removeImageButton} onPress={() => setActiveVariantImageUri('')}><Text style={styles.removeImageText}>Remove Photo</Text></TouchableOpacity> : null}
+                    </>
+                  )}
+
+                  <Text style={styles.inputLabel}>Material Name:</Text>
+                  <TextInput style={styles.modalInput} value={activeVariantName} onChangeText={setActiveVariantName} placeholder="Material name" placeholderTextColor="#777" />
+                  <Text style={styles.inputLabel}>Size / Variant:</Text>
+                  <TextInput style={styles.modalInput} value={activeVariantSize} onChangeText={setActiveVariantSize} placeholder="e.g.: 3/4, #12 Black, 5/16" placeholderTextColor="#777" />
+                  <Text style={styles.inputLabel}>Description:</Text>
+                  <TextInput style={[styles.modalInput, styles.descriptionInput]} value={activeVariantDescription} onChangeText={setActiveVariantDescription} multiline placeholder="Description for this material" placeholderTextColor="#777" />
+                  <TouchableOpacity style={styles.hardDeleteConfirmRow} onPress={() => setActiveVariantForceShowDescription((v) => !v)}>
+                    <Text style={[styles.hardDeleteCheckbox, { color: '#0a192f' }]}>{activeVariantForceShowDescription ? '☑' : '☐'}</Text>
+                    <Text style={[styles.hardDeleteWarning, { color: '#0a192f' }]}>Always show description during selection</Text>
+                  </TouchableOpacity>
+                  <View style={styles.modalActions}>
+                    <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#8892b0' }]} onPress={() => setVariantEditorVisible(false)}><Text style={styles.btnText}>Cancel</Text></TouchableOpacity>
+                    <TouchableOpacity style={[styles.modalBtn, { backgroundColor: '#0275d8' }]} onPress={saveVariantEditor}><Text style={styles.btnText}>Save Item</Text></TouchableOpacity>
+                  </View>
+                </ScrollView>
               </View>
             </KeyboardAvoidingView>
           </SafeAreaView>
@@ -1420,7 +1427,17 @@ const styles = StyleSheet.create({
   variantCardTitle: { color: '#0a192f', fontWeight: '900', fontSize: 14 },
   variantCardLine: { color: '#0275d8', fontWeight: '700', marginTop: 4, fontSize: 12 },
   variantCardDescription: { color: '#475569', marginTop: 4, fontSize: 11 },
-  variantEditorModal: { backgroundColor: '#ccd6f6', padding: 20, borderRadius: 15, marginTop: 'auto', marginBottom: 'auto' },
+  variantEditorModal: {
+    backgroundColor: '#ccd6f6',
+    borderRadius: 15,
+    maxHeight: '92%',
+    marginTop: 'auto',
+    marginBottom: 'auto',
+    paddingTop: 20,
+    paddingHorizontal: 20,
+    paddingBottom: 0,
+  },
+  variantEditorScrollContent: { paddingBottom: 34 },
   deleteButton: { marginTop: 20, padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#e74c3c', alignItems: 'center', backgroundColor: '#fff' },
   deleteButtonText: { color: '#e74c3c', fontWeight: 'bold', fontSize: 13 },
   hardDeleteBox: { marginTop: 12, padding: 12, borderRadius: 10, backgroundColor: '#fee2e2', borderWidth: 1, borderColor: '#ef4444' },
