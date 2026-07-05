@@ -82,8 +82,12 @@ const CATEGORIES_CACHE_KEY = '@material_categories_cache_v1';
 const UNIT_MEASURES_CACHE_KEY = '@material_unit_measures_cache_v1';
 const IMPORTANT_INFO_CACHE_KEY = '@important_info_cache_v1';
 const CATALOG_CACHE_SCHEMA_KEY = '@material_catalog_cache_schema_version';
-const CATALOG_CACHE_SCHEMA_VERSION = 'storage-url-thumbnail-lazy-cache-v3';
+const CATALOG_CACHE_SCHEMA_VERSION = 'incremental-sync-storage-url-thumbnail-lazy-cache-v4';
 const CATALOG_CLOUD_UPDATED_AT_KEY = '@material_catalog_cloud_updated_at_v1';
+const CATALOG_LAST_INCREMENTAL_SYNC_AT_KEY = '@material_catalog_last_incremental_sync_at_v1';
+const SETTINGS_CLOUD_UPDATED_AT_KEY = '@material_settings_cloud_updated_at_v1';
+const CATALOG_DELETED_ENDPOINT = `${FIREBASE_DATABASE_URL}/catalogDeleted.json`;
+const SETTINGS_META_ENDPOINT = `${FIREBASE_DATABASE_URL}/meta/settings.json`;
 
 // Default catalog categories and unit measures. These are kept locally so the
 // app always works offline, and owner accounts can also seed them into Firebase
@@ -529,6 +533,52 @@ const setRemoteCatalogUpdatedAt = async () => {
   }
 };
 
+
+const buildOptionalAuthenticatedFirebaseUrl = async (baseUrl, queryParameters = '') => {
+  const idToken = await AuthService.getCurrentIdToken();
+  const joiner = queryParameters ? '&' : '?';
+  return `${baseUrl}${queryParameters || ''}${idToken ? `${joiner}auth=${encodeURIComponent(idToken)}` : ''}`;
+};
+
+const encodeFirebaseQueryStringValue = (value) => encodeURIComponent(JSON.stringify(value));
+
+const buildFirebaseOrderedQueryUrl = async ({ endpointBase, orderByChild, startAt, limitToFirst }) => {
+  const queryParts = [`orderBy=${encodeFirebaseQueryStringValue(orderByChild)}`];
+  if (startAt) queryParts.push(`startAt=${encodeFirebaseQueryStringValue(startAt)}`);
+  if (limitToFirst) queryParts.push(`limitToFirst=${Number(limitToFirst)}`);
+  return await buildOptionalAuthenticatedFirebaseUrl(endpointBase, `?${queryParts.join('&')}`);
+};
+
+const setRemoteSettingsUpdatedAt = async () => {
+  try {
+    const userLabel = await getCurrentAuditUserLabel();
+    const metaUrl = await buildAuthenticatedFirebaseUrl(SETTINGS_META_ENDPOINT);
+    const now = new Date().toISOString();
+    const response = await fetch(metaUrl, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updatedAt: now, updatedBy: userLabel })
+    });
+    if (response.ok) await AsyncStorage.setItem(SETTINGS_CLOUD_UPDATED_AT_KEY, now);
+    return now;
+  } catch (error) {
+    console.warn('StorageService Warning (settings metadata update skipped):', error);
+    return '';
+  }
+};
+
+const getRemoteSettingsUpdatedAt = async () => {
+  try {
+    const response = await fetch(SETTINGS_META_ENDPOINT);
+    if (!response.ok) return '';
+    const metadata = await response.json();
+    return metadata?.updatedAt || '';
+  } catch (error) {
+    console.warn('StorageService Warning (settings metadata fetch skipped):', error);
+    return '';
+  }
+};
+
 /**
  * Saves a base64 data URI as a local image file and returns the file:// path.
  *
@@ -650,6 +700,8 @@ const normalizeMaterial = (material) => {
     updatedAt: material.updatedAt || new Date().toISOString(),
     requestCount: Number(material.requestCount || 0),
     lastRequestedAt: material.lastRequestedAt || '',
+    deletedAt: material.deletedAt || '',
+    version: Number(material.version || 1),
     createdBy: material.createdBy || FALLBACK_USER_LABEL,
     updatedBy: material.updatedBy || FALLBACK_USER_LABEL
   };
@@ -943,13 +995,50 @@ const saveCatalogToSQLite = async (catalog) => {
   });
 };
 
+
+/**
+ * Merges only changed catalog rows into SQLite. This is used by normal app
+ * startup/focus so a device does not download and rewrite the whole catalog
+ * when Firebase only changed one material.
+ */
+const mergeCatalogChangesIntoSQLite = async (catalogChanges = []) => {
+  const activeChanges = (catalogChanges || [])
+    .map(normalizeMaterial)
+    .filter((material) => !material.deletedAt);
+  const cacheCatalog = (await createFamilySharedImageCatalogCache(activeChanges)).map(createCatalogCacheRecord);
+
+  await runSQLiteWriteSafely(async () => {
+    const database = await getSQLiteDatabase();
+    for (const material of cacheCatalog) {
+      const normalized = createCatalogCacheRecord(material);
+      await database.runAsync(
+        `INSERT OR REPLACE INTO ${CATALOG_TABLE_NAME} (id, data, updatedAt, deleted) VALUES (?, ?, ?, ?);`,
+        [normalized.id, JSON.stringify(normalized), normalized.updatedAt || '', 0]
+      );
+    }
+  });
+};
+
+const removeCatalogRowsFromSQLite = async (materialIds = []) => {
+  const ids = [...new Set((materialIds || []).filter(Boolean))];
+  if (ids.length === 0) return;
+  await runSQLiteWriteSafely(async () => {
+    const database = await getSQLiteDatabase();
+    for (const id of ids) {
+      await database.runAsync(`DELETE FROM ${CATALOG_TABLE_NAME} WHERE id = ?;`, [id]);
+    }
+    // Keep the local cache small after batches of owner deletes.
+    if (ids.length > 10) await database.runAsync(`VACUUM;`);
+  });
+};
+
 /**
  * Reads catalog rows from SQLite and hides soft-deleted records from normal UI.
  */
 const loadCatalogFromSQLite = async () => {
   const database = await getSQLiteDatabase();
-  const rows = await database.getAllAsync(`SELECT data FROM ${CATALOG_TABLE_NAME};`);
-  return sortCatalog(rows.map((row) => normalizeMaterial(JSON.parse(row.data))));
+  const rows = await database.getAllAsync(`SELECT data FROM ${CATALOG_TABLE_NAME} WHERE deleted = 0;`);
+  return sortCatalog(rows.map((row) => normalizeMaterial(JSON.parse(row.data))).filter((material) => !material.deletedAt));
 };
 
 /**
@@ -1141,7 +1230,8 @@ export const StorageService = {
    * local data while a cloud refresh runs in the background.
    */
   async syncCatalogFromFirebase() {
-    const response = await fetch(MATERIALS_ENDPOINT);
+    const materialsUrl = await buildOptionalAuthenticatedFirebaseUrl(MATERIALS_ENDPOINT);
+    const response = await fetch(materialsUrl);
 
     if (!response.ok) {
       throw new Error(`Firebase load failed: ${response.status}`);
@@ -1156,6 +1246,8 @@ export const StorageService = {
 
     catalog = sortCatalog(catalog);
     await this.saveCatalogCache(catalog);
+    const newestUpdatedAt = catalog.reduce((latest, material) => String(material.updatedAt || '') > latest ? String(material.updatedAt || '') : latest, '');
+    if (newestUpdatedAt) await AsyncStorage.setItem(CATALOG_LAST_INCREMENTAL_SYNC_AT_KEY, newestUpdatedAt);
     return catalog;
   },
 
@@ -1196,9 +1288,52 @@ export const StorageService = {
       return await this.loadCatalogCache();
     }
 
-    const catalog = await this.syncCatalogFromFirebase();
-    if (remoteUpdatedAt) await AsyncStorage.setItem(CATALOG_CLOUD_UPDATED_AT_KEY, remoteUpdatedAt);
-    return catalog;
+    const lastIncrementalSyncAt = await AsyncStorage.getItem(CATALOG_LAST_INCREMENTAL_SYNC_AT_KEY);
+    if (!lastIncrementalSyncAt) {
+      const fullCatalog = await this.syncCatalogFromFirebase();
+      if (remoteUpdatedAt) await AsyncStorage.setItem(CATALOG_CLOUD_UPDATED_AT_KEY, remoteUpdatedAt);
+      return fullCatalog;
+    }
+
+    const changesUrl = await buildFirebaseOrderedQueryUrl({
+      endpointBase: MATERIALS_ENDPOINT,
+      orderByChild: 'updatedAt',
+      startAt: lastIncrementalSyncAt
+    });
+    const changesResponse = await fetch(changesUrl);
+    if (!changesResponse.ok) {
+      throw new Error(`Firebase incremental catalog sync failed: ${changesResponse.status}`);
+    }
+
+    const changesData = await changesResponse.json();
+    const changedCatalog = convertFirebaseObjectToArray(changesData)
+      .map(normalizeMaterial)
+      .filter((material) => String(material.updatedAt || '') > String(lastIncrementalSyncAt || ''));
+
+    await mergeCatalogChangesIntoSQLite(changedCatalog);
+
+    const deletedUrl = await buildFirebaseOrderedQueryUrl({
+      endpointBase: CATALOG_DELETED_ENDPOINT,
+      orderByChild: 'deletedAt',
+      startAt: lastIncrementalSyncAt
+    });
+    const deletedResponse = await fetch(deletedUrl);
+    if (deletedResponse.ok) {
+      const deletedData = await deletedResponse.json();
+      const deletedIds = convertFirebaseObjectToArray(deletedData)
+        .filter((record) => String(record.deletedAt || '') > String(lastIncrementalSyncAt || ''))
+        .map((record) => record.id)
+        .filter(Boolean);
+      await removeCatalogRowsFromSQLite(deletedIds);
+    }
+
+    const newestChangedAt = changedCatalog.reduce((latest, material) => String(material.updatedAt || '') > latest ? String(material.updatedAt || '') : latest, lastIncrementalSyncAt);
+    const nextSyncAt = remoteUpdatedAt || newestChangedAt || new Date().toISOString();
+    await AsyncStorage.multiSet([
+      [CATALOG_LAST_INCREMENTAL_SYNC_AT_KEY, nextSyncAt],
+      [CATALOG_CLOUD_UPDATED_AT_KEY, remoteUpdatedAt || nextSyncAt]
+    ]);
+    return await this.loadCatalogCache();
   },
 
 
@@ -1290,6 +1425,7 @@ export const StorageService = {
         createdAt: material.createdAt || now,
         updatedAt: now,
         createdBy: material.createdBy || userLabel,
+        version: Number(material.version || 1),
         updatedBy: userLabel
       });
 
@@ -1356,7 +1492,10 @@ export const StorageService = {
       const userLabel = await getCurrentAuditUserLabel();
       const now = new Date().toISOString();
 
-      let normalizedUpdates = materialVariants.map((variant) => normalizeMaterial({
+      const existingByIdForVersion = new Map(existingCatalog.map((item) => [item.id, item]));
+      let normalizedUpdates = materialVariants.map((variant) => {
+        const previousVariant = existingByIdForVersion.get(variant.id) || {};
+        return normalizeMaterial({
         ...variant,
         id: variant.id,
         name: (variant.name || '').trim(),
@@ -1368,8 +1507,10 @@ export const StorageService = {
         createdAt: variant.createdAt || now,
         createdBy: variant.createdBy || userLabel,
         updatedAt: now,
+        version: Number(previousVariant.version || variant.version || 1) + 1,
         updatedBy: userLabel
-      }));
+      });
+      });
 
       normalizedUpdates = await Promise.all(normalizedUpdates.map(saveCatalogImagesToFirebaseStorage));
 
@@ -1470,6 +1611,7 @@ export const StorageService = {
         createdAt: materialChanges.createdAt || new Date().toISOString(),
         createdBy: materialChanges.createdBy || userLabel,
         updatedAt: new Date().toISOString(),
+        version: Number(existingMaterial.version || materialChanges.version || 1) + 1,
         updatedBy: userLabel
       });
 
@@ -1854,7 +1996,7 @@ export const StorageService = {
         await fetch(url, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: category, isCustom: false, protected: true, updatedAt: now })
+          body: JSON.stringify({ name: category, isCustom: false, protected: true, updatedAt: now, deletedAt: '', version: 1 })
         });
       }));
 
@@ -1864,10 +2006,11 @@ export const StorageService = {
         await fetch(url, {
           method: 'PUT',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: unit, isCustom: false, protected: true, updatedAt: now })
+          body: JSON.stringify({ name: unit, isCustom: false, protected: true, updatedAt: now, deletedAt: '', version: 1 })
         });
       }));
 
+      await setRemoteSettingsUpdatedAt();
       return true;
     } catch (error) {
       console.warn('StorageService Warning (ensureDefaultCatalogSettingsInFirebase):', error);
@@ -1880,6 +2023,7 @@ export const StorageService = {
    */
   async loadCategories() {
     try {
+      StorageService.ensureDefaultCatalogSettingsInFirebase().catch(() => {});
       const cached = await AsyncStorage.getItem(CATEGORIES_CACHE_KEY);
       if (cached) {
         // Background sync
@@ -1916,6 +2060,7 @@ export const StorageService = {
         // or as objects like { name, isCustom, createdBy }. Support both so
         // existing databases keep working after this update.
         const remoteCategories = Object.values(data)
+          .filter((categoryRecord) => typeof categoryRecord === 'string' || !categoryRecord?.deletedAt)
           .map((categoryRecord) => (
             typeof categoryRecord === 'string'
               ? normalizeCategoryName(categoryRecord)
@@ -1935,10 +2080,8 @@ export const StorageService = {
 
   async addCategory(newCategory) {
     try {
+      await ensureSharedDataEditor();
       const user = await AuthService.getCurrentUser();
-      const isOwner = user?.role === 'owner';
-
-      if (!isOwner) throw new Error('ONLY_OWNER_CAN_ADD_CATEGORIES');
 
       const cleanCategory = normalizeCategoryName(newCategory);
       if (!cleanCategory) throw new Error('EMPTY_CATEGORY');
@@ -1961,8 +2104,10 @@ export const StorageService = {
           isCustom: true,
           createdAt: now,
           updatedAt: now,
-          createdBy: user?.uid || user?.email || 'owner',
-          updatedBy: user?.uid || user?.email || 'owner'
+          deletedAt: '',
+          version: 1,
+          createdBy: user?.uid || user?.email || 'editor',
+          updatedBy: user?.uid || user?.email || 'editor'
         })
       });
 
@@ -1978,6 +2123,7 @@ export const StorageService = {
         throw error;
       }
 
+      await setRemoteSettingsUpdatedAt();
       return await StorageService.syncCategoriesFromFirebase();
     } catch (e) {
       console.error('StorageService Error (addCategory):', e);
@@ -1993,6 +2139,7 @@ export const StorageService = {
    */
   async loadUnitMeasures() {
     try {
+      StorageService.ensureDefaultCatalogSettingsInFirebase().catch(() => {});
       const cached = await AsyncStorage.getItem(UNIT_MEASURES_CACHE_KEY);
       if (cached) {
         StorageService.syncUnitMeasuresFromFirebase().catch(console.error);
@@ -2020,6 +2167,7 @@ export const StorageService = {
       let unitMeasures = DEFAULT_UNIT_MEASURES;
       if (data) {
         const remoteUnits = Object.values(data)
+          .filter((unitRecord) => typeof unitRecord === 'string' || !unitRecord?.deletedAt)
           .map((unitRecord) => (typeof unitRecord === 'string' ? String(unitRecord).trim() : String(unitRecord?.name || '').trim()))
           .filter(Boolean);
         unitMeasures = [...new Set([...DEFAULT_UNIT_MEASURES, ...remoteUnits])].sort();
@@ -2058,6 +2206,8 @@ export const StorageService = {
           isCustom: true,
           createdAt: now,
           updatedAt: now,
+          deletedAt: '',
+          version: 1,
           createdBy: user?.uid || user?.email || 'editor',
           updatedBy: user?.uid || user?.email || 'editor'
         })
@@ -2096,8 +2246,13 @@ export const StorageService = {
       const categoryKey = createCategoryKey(cleanCategory);
       if (!categoryKey) throw new Error('INVALID_CATEGORY');
 
+      const now = new Date().toISOString();
       const categoryUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/categories/${categoryKey}.json`);
-      const response = await fetch(categoryUrl, { method: 'DELETE' });
+      const response = await fetch(categoryUrl, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ deletedAt: now, updatedAt: now, updatedBy: user?.uid || user?.email || 'owner' })
+      });
 
       const existing = await StorageService.loadCategories();
       const updatedCategories = existing.filter((category) => category.toLowerCase() !== cleanCategory.toLowerCase());
@@ -2112,6 +2267,7 @@ export const StorageService = {
         throw error;
       }
 
+      await setRemoteSettingsUpdatedAt();
       return await StorageService.syncCategoriesFromFirebase();
     } catch (e) {
       console.error('StorageService Error (deleteCategory):', e);
@@ -2138,6 +2294,15 @@ export const StorageService = {
       await deleteFirebaseStorageFileIfPossible(materialToDelete?.imageStoragePath);
       await deleteFirebaseStorageFileIfPossible(materialToDelete?.groupCoverStoragePath);
 
+      const now = new Date().toISOString();
+      const deletedBy = user?.uid || user?.email || 'owner';
+      const deleteLogUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/catalogDeleted/${materialId}.json`);
+      await fetch(deleteLogUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: materialId, deletedAt: now, deletedBy })
+      });
+
       const materialUrl = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/materials/${materialId}.json`);
       const response = await fetch(materialUrl, {
         method: 'DELETE'
@@ -2154,12 +2319,29 @@ export const StorageService = {
     }
   },
 
+  async compactLocalCatalogCache() {
+    try {
+      const database = await getSQLiteDatabase();
+      await database.runAsync(`DELETE FROM ${CATALOG_TABLE_NAME} WHERE deleted = 1;`);
+      await database.runAsync(`VACUUM;`);
+      return true;
+    } catch (error) {
+      console.warn('StorageService Warning (compactLocalCatalogCache):', error);
+      return false;
+    }
+  },
+
+  async resetIncrementalSyncState() {
+    await AsyncStorage.multiRemove([CATALOG_LAST_INCREMENTAL_SYNC_AT_KEY, CATALOG_CLOUD_UPDATED_AT_KEY, SETTINGS_CLOUD_UPDATED_AT_KEY]);
+    return true;
+  },
+
   /**
    * Wipes only local data. It does not delete the Firebase catalog.
    */
   async clearLocalCatalogCache() {
     await resetCatalogSQLiteCache();
-    await AsyncStorage.multiRemove([CATALOG_CACHE_KEY, CATALOG_CACHE_SCHEMA_KEY]);
+    await AsyncStorage.multiRemove([CATALOG_CACHE_KEY, CATALOG_CACHE_SCHEMA_KEY, CATALOG_LAST_INCREMENTAL_SYNC_AT_KEY, CATALOG_CLOUD_UPDATED_AT_KEY]);
   },
 
   async clearAllData() {

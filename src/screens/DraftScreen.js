@@ -110,7 +110,7 @@ export default function DraftScreen({ navigation, route, currentUser }) {
 
     const subscription = BackHandler.addEventListener('hardwareBackPress', handleDeviceBack);
     return () => subscription.remove();
-  }, [mainMenuVisible, oneTimeModalVisible]);
+  }, [mainMenuVisible, oneTimeModalVisible, editModalVisible, currentUser]);
 
   // Helper function that sorts material rows alphabetically by material name. This keeps the exported list clean and predictable.
   const sortItemsByName = (array) => {
@@ -592,7 +592,7 @@ export default function DraftScreen({ navigation, route, currentUser }) {
       {/* One-Time Material Modal
           This modal creates a temporary row only for the current requisition.
           It does not call StorageService.addMaterial, so nothing is saved to Firebase. */}
-      <Modal visible={mainMenuVisible} transparent animationType="fade">
+      <Modal visible={mainMenuVisible} transparent animationType="fade" onRequestClose={() => setMainMenuVisible(false)}>
         <View style={styles.menuOverlay}>
           <View style={styles.menuContent}>
             <TouchableOpacity style={styles.menuCloseIconButton} onPress={() => setMainMenuVisible(false)}>
@@ -615,7 +615,7 @@ export default function DraftScreen({ navigation, route, currentUser }) {
         </View>
       </Modal>
 
-      <Modal visible={oneTimeModalVisible} transparent animationType="fade">
+      <Modal visible={oneTimeModalVisible} transparent animationType="fade" onRequestClose={() => setOneTimeModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea}>
             <View style={styles.modalContent}>
@@ -687,7 +687,7 @@ export default function DraftScreen({ navigation, route, currentUser }) {
       </Modal>
 
       {/* Edit Material Modal */}
-      <Modal visible={editModalVisible} transparent animationType="fade">
+      <Modal visible={editModalVisible} transparent animationType="fade" onRequestClose={() => setEditModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea}>
             <View style={styles.modalContent}>

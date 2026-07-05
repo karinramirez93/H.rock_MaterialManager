@@ -513,7 +513,7 @@ export default function ImportantInfoScreen({ navigation, currentUser }) {
         renderItem={({ item }) => viewMode === 'thumbnail' ? renderThumbnailCard(item) : renderTitleOnlyCard(item)}
       />
 
-      <Modal visible={viewerVisible} transparent animationType="fade">
+      <Modal visible={viewerVisible} transparent animationType="fade" onRequestClose={closeImageViewer}>
         <SafeAreaView style={styles.viewerOverlay} edges={['top', 'left', 'right', 'bottom']}>
           <View style={styles.viewerHeader}>
             <View style={{ flex: 1 }}>
@@ -546,7 +546,7 @@ export default function ImportantInfoScreen({ navigation, currentUser }) {
         </SafeAreaView>
       </Modal>
 
-      <Modal visible={modalVisible} transparent animationType="fade">
+      <Modal visible={modalVisible} transparent animationType="fade" onRequestClose={() => setModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea} edges={['top', 'left', 'right', 'bottom']}>
             <View style={styles.modalContent}>

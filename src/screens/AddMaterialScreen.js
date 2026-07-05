@@ -791,7 +791,11 @@ export default function AddMaterialScreen({ navigation, currentUser }) {
           <View style={styles.optionContainer}>
             {[...unitOptions, 'Custom Unit'].map((unit) => (
               <TouchableOpacity key={unit} style={[styles.optionButton, allowedUnits.includes(unit) && styles.optionButtonActive]} onPress={() => toggleAllowedUnit(unit)}>
-                <Text style={[styles.optionText, allowedUnits.includes(unit) && styles.optionTextActive]}>{unit.toUpperCase()}</Text>
+                <Text style={[
+                  styles.optionText,
+                  unit === 'Custom Unit' && !allowedUnits.includes(unit) ? { color: '#64ffda' } : null,
+                  allowedUnits.includes(unit) && styles.optionTextActive
+                ]}>{unit.toUpperCase()}</Text>
               </TouchableOpacity>
             ))}
           </View>

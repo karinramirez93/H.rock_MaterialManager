@@ -51,7 +51,7 @@ const ImageZoomModal = ({ visible, imageUri, onClose }) => {
   if (!imageUri) return null;
 
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <GestureHandlerRootView style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.9)' }}>
         <TouchableOpacity
           style={styles.zoomCloseButton}
@@ -82,7 +82,7 @@ const HoldImagePreviewModal = ({ imageUri }) => {
   if (!imageUri) return null;
 
   return (
-    <Modal visible={Boolean(imageUri)} transparent animationType="fade">
+    <Modal visible={Boolean(imageUri)} transparent animationType="fade" onRequestClose={() => {}}>
       <View style={styles.holdPreviewOverlay} pointerEvents="none">
         <View style={styles.holdPreviewCard}>
           <Image
@@ -833,13 +833,18 @@ export default function CatalogScreen({ navigation, currentUser }) {
   // This keeps the phone's native Back control working the same way users expect.
   useFocusEffect(useCallback(() => {
     const handleDeviceBack = () => {
-      if (menuModalVisible) {
-        setMenuModalVisible(false);
+      if (zoomVisible) {
+        setZoomVisible(false);
         return true;
       }
 
       if (modalVisible) {
         setModalVisible(false);
+        return true;
+      }
+
+      if (menuModalVisible) {
+        setMenuModalVisible(false);
         return true;
       }
 
@@ -859,7 +864,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
 
     const subscription = BackHandler.addEventListener('hardwareBackPress', handleDeviceBack);
     return () => subscription.remove();
-  }, [navigation, menuModalVisible, modalVisible, isMultiSelectMode]));
+  }, [navigation, zoomVisible, modalVisible, menuModalVisible, isMultiSelectMode]));
 
   const handleSearch = (text) => {
     setSearch(text);
@@ -1383,7 +1388,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
         </View>
       ) : null}
 
-      <Modal visible={menuModalVisible} transparent animationType="slide">
+      <Modal visible={menuModalVisible} transparent animationType="slide" onRequestClose={() => setMenuModalVisible(false)}>
         <View style={styles.sortModalOverlay}>
           <View style={styles.sortModalContent}>
             <Text style={styles.sortModalTitle}>Filters & Organization</Text>
@@ -1431,7 +1436,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
         </View>
       </Modal>
 
-      <Modal visible={modalVisible} transparent animationType="fade">
+      <Modal visible={modalVisible} transparent animationType="fade" onRequestClose={() => setModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
             <View style={styles.modalContent}>

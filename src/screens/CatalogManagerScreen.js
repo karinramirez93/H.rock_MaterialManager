@@ -46,7 +46,7 @@ const ImageZoomModal = ({ visible, imageUri, onClose }) => {
   if (!imageUri) return null;
 
   return (
-    <Modal visible={visible} transparent animationType="fade">
+    <Modal visible={visible} transparent animationType="fade" onRequestClose={onClose}>
       <GestureHandlerRootView style={{ flex: 1, backgroundColor: 'rgba(0,0,0,0.9)' }}>
         <TouchableOpacity
           style={styles.zoomCloseButton}
@@ -490,12 +490,29 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
 
   useFocusEffect(useCallback(() => {
     const handleDeviceBack = () => {
-      if (menuModalVisible) {
-        setMenuModalVisible(false);
+      if (zoomVisible) {
+        setZoomVisible(false);
+        return true;
+      }
+      if (variantEditorVisible) {
+        setVariantEditorVisible(false);
+        return true;
+      }
+      if (groupModalVisible) {
+        setGroupModalVisible(false);
         return true;
       }
       if (modalVisible) {
         setModalVisible(false);
+        return true;
+      }
+      if (menuModalVisible) {
+        setMenuModalVisible(false);
+        return true;
+      }
+      if (isMultiSelectMode) {
+        setSelectedItems([]);
+        setIsMultiSelectMode(false);
         return true;
       }
       if (navigation.canGoBack()) {
@@ -506,7 +523,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
     };
     const subscription = BackHandler.addEventListener('hardwareBackPress', handleDeviceBack);
     return () => subscription.remove();
-  }, [navigation, modalVisible, menuModalVisible]));
+  }, [navigation, zoomVisible, variantEditorVisible, groupModalVisible, modalVisible, menuModalVisible, isMultiSelectMode]));
 
   const handleSearch = (text) => {
     setSearch(text);
@@ -959,7 +976,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
         </View>
       )}
 
-      <Modal visible={menuModalVisible} transparent animationType="slide">
+      <Modal visible={menuModalVisible} transparent animationType="slide" onRequestClose={() => setMenuModalVisible(false)}>
         <View style={styles.menuModalOverlay}>
           <View style={styles.menuModalContent}>
             <Text style={styles.menuModalTitle}>Filters & Organization</Text>
@@ -998,7 +1015,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
         </View>
       </Modal>
 
-      <Modal visible={modalVisible} transparent animationType="fade">
+      <Modal visible={modalVisible} transparent animationType="fade" onRequestClose={() => setModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
             <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={20}>
@@ -1178,7 +1195,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
         </View>
       </Modal>
 
-      <Modal visible={variantEditorVisible} transparent animationType="slide">
+      <Modal visible={variantEditorVisible} transparent animationType="slide" onRequestClose={() => setVariantEditorVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
             <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={20}>
@@ -1234,7 +1251,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
         </View>
       </Modal>
 
-      <Modal visible={groupModalVisible} transparent animationType="slide">
+      <Modal visible={groupModalVisible} transparent animationType="slide" onRequestClose={() => setGroupModalVisible(false)}>
         <View style={styles.modalOverlay}>
           <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
             <View style={styles.modalContent}>
