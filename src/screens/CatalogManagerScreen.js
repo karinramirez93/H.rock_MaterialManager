@@ -8,7 +8,7 @@
  * shared family information: image, name, description, category, and units.
  */
 import React, { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { StyleSheet, Text, View, FlatList, TextInput, TouchableOpacity, Modal, ActivityIndicator, Image, Alert, ScrollView, BackHandler, RefreshControl, KeyboardAvoidingView, Platform, Dimensions } from 'react-native';
+import { StyleSheet, Text, View, FlatList, TextInput, TouchableOpacity, Modal, ActivityIndicator, Image, Alert, ScrollView, BackHandler, RefreshControl, KeyboardAvoidingView, Platform, Dimensions, Keyboard } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { StorageService } from '../database/storage';
 import CachedCatalogImage from '../components/CachedCatalogImage';
@@ -315,6 +315,8 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   const [lastSyncMessage, setLastSyncMessage] = useState('');
   const [currentPage, setCurrentPage] = useState(1);
   const listRef = useRef(null);
+  const editModalScrollRef = useRef(null);
+  const variantEditorScrollRef = useRef(null);
   const [saving, setSaving] = useState(false);
   const [modalVisible, setModalVisible] = useState(false);
   const [selectedItem, setSelectedItem] = useState(null);
@@ -349,6 +351,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
 
   const [zoomVisible, setZoomVisible] = useState(false);
   const [zoomImageUri, setZoomImageUri] = useState('');
+  const [keyboardVisible, setKeyboardVisible] = useState(false);
 
   const totalPages = Math.max(1, Math.ceil(filtered.length / ITEMS_PER_PAGE));
   const paginatedFamilies = useMemo(() => {
@@ -359,6 +362,27 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
   useEffect(() => {
     if (currentPage > totalPages) setCurrentPage(totalPages);
   }, [currentPage, totalPages]);
+
+  useEffect(() => {
+    const showSubscription = Keyboard.addListener('keyboardDidShow', () => setKeyboardVisible(true));
+    const hideSubscription = Keyboard.addListener('keyboardDidHide', () => setKeyboardVisible(false));
+    return () => {
+      showSubscription.remove();
+      hideSubscription.remove();
+    };
+  }, []);
+
+  const scrollEditModalTo = (yPosition) => {
+    setTimeout(() => {
+      editModalScrollRef.current?.scrollTo?.({ y: yPosition, animated: true });
+    }, 150);
+  };
+
+  const scrollVariantEditorTo = (yPosition) => {
+    setTimeout(() => {
+      variantEditorScrollRef.current?.scrollTo?.({ y: yPosition, animated: true });
+    }, 150);
+  };
 
   const goToPage = (pageNumber) => {
     const safePage = Math.min(Math.max(1, pageNumber), totalPages);
@@ -1035,13 +1059,13 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
 
       <Modal visible={modalVisible} transparent animationType="fade" onRequestClose={() => setModalVisible(false)}>
         <View style={styles.modalOverlay}>
-          <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
-            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={0}>
-            <View style={styles.modalContent}>
+          <SafeAreaView style={[styles.modalSafeArea, keyboardVisible && styles.modalSafeAreaKeyboard]} edges={['top','left','right','bottom']}>
+            <KeyboardAvoidingView style={styles.keyboardAvoider} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={0}>
+            <View style={[styles.modalContent, keyboardVisible && styles.keyboardModalContent]}>
               <TouchableOpacity style={styles.closeIconButton} onPress={() => setModalVisible(false)}>
                 <Text style={styles.closeIconText}>✕</Text>
               </TouchableOpacity>
-              <ScrollView showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled">
+              <ScrollView ref={editModalScrollRef} showsVerticalScrollIndicator={false} keyboardShouldPersistTaps="handled" contentContainerStyle={styles.editModalScrollContent}>
                 <Text style={styles.modalTitle}>{selectedItem?.isFamilyGroup ? 'EDIT MATERIAL FAMILY' : 'EDIT CATALOG MATERIAL'}</Text>
                 <Text style={styles.modalSubtitle}>Manage group cover and individual material details.</Text>
 
@@ -1077,7 +1101,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                 </View>
 
                 <Text style={styles.inputLabel}>Family / Material Name:</Text>
-                <TextInput style={styles.modalInput} value={editName} onChangeText={handleEditNameChange} />
+                <TextInput style={styles.modalInput} value={editName} onChangeText={handleEditNameChange} onFocus={() => scrollEditModalTo(220)} />
 
                 <TouchableOpacity
                   style={styles.changeFamilyButton}
@@ -1115,6 +1139,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                         }}
                         placeholder="New group name..."
                         placeholderTextColor="#777"
+                        onFocus={() => scrollEditModalTo(330)}
                       />
                     ) : (
                       <View>
@@ -1124,6 +1149,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                           onChangeText={setGroupSearchText}
                           placeholder="Search group..."
                           placeholderTextColor="#777"
+                          onFocus={() => scrollEditModalTo(330)}
                         />
                         <ScrollView style={{ maxHeight: 150 }} nestedScrollEnabled>
                           {buildCatalogDisplayItems(catalog)
@@ -1171,7 +1197,7 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                 <Text style={styles.helperText}>Tap any material in this family to open a focused editor for name, size, and description.</Text>
 
                 <Text style={styles.inputLabel}>Family / Group Catalog Description:</Text>
-                <TextInput style={[styles.modalInput, styles.descriptionInput]} value={editDescription} onChangeText={setEditDescription} multiline placeholder="Optional description for this family/group only" placeholderTextColor="#777" />
+                <TextInput style={[styles.modalInput, styles.descriptionInput]} value={editDescription} onChangeText={setEditDescription} multiline placeholder="Optional description for this family/group only" placeholderTextColor="#777" onFocus={() => scrollEditModalTo(650)} />
                 <Text style={styles.helperText}>This group description will not overwrite the personal description of each material. Tap a material above to edit its own description.</Text>
 
                 <Text style={styles.inputLabel}>Family Display Layout:</Text>
@@ -1216,13 +1242,14 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
 
       <Modal visible={variantEditorVisible} transparent animationType="slide" onRequestClose={() => setVariantEditorVisible(false)}>
         <View style={styles.modalOverlay}>
-          <SafeAreaView style={styles.modalSafeArea} edges={['top','left','right','bottom']}>
-            <KeyboardAvoidingView style={{ flex: 1 }} behavior={Platform.OS === 'ios' ? 'padding' : 'height'} keyboardVerticalOffset={0}>
-              <View style={styles.variantEditorModal}>
+          <SafeAreaView style={[styles.modalSafeArea, keyboardVisible && styles.modalSafeAreaKeyboard]} edges={['top','left','right','bottom']}>
+            <KeyboardAvoidingView style={styles.keyboardAvoider} behavior={Platform.OS === 'ios' ? 'padding' : undefined} keyboardVerticalOffset={0}>
+              <View style={[styles.variantEditorModal, keyboardVisible && styles.keyboardVariantEditorModal]}>
                 <TouchableOpacity style={styles.closeIconButton} onPress={() => setVariantEditorVisible(false)}>
                   <Text style={styles.closeIconText}>✕</Text>
                 </TouchableOpacity>
                 <ScrollView
+                  ref={variantEditorScrollRef}
                   showsVerticalScrollIndicator={false}
                   keyboardShouldPersistTaps="handled"
                   keyboardDismissMode="interactive"
@@ -1257,11 +1284,11 @@ export default function CatalogManagerScreen({ navigation, currentUser }) {
                   )}
 
                   <Text style={styles.inputLabel}>Material Name:</Text>
-                  <TextInput style={styles.modalInput} value={activeVariantName} onChangeText={setActiveVariantName} placeholder="Material name" placeholderTextColor="#777" />
+                  <TextInput style={styles.modalInput} value={activeVariantName} onChangeText={setActiveVariantName} placeholder="Material name" placeholderTextColor="#777" onFocus={() => scrollVariantEditorTo(330)} />
                   <Text style={styles.inputLabel}>Size / Variant:</Text>
-                  <TextInput style={styles.modalInput} value={activeVariantSize} onChangeText={setActiveVariantSize} placeholder="e.g.: 3/4, #12 Black, 5/16" placeholderTextColor="#777" />
+                  <TextInput style={styles.modalInput} value={activeVariantSize} onChangeText={setActiveVariantSize} placeholder="e.g.: 3/4, #12 Black, 5/16" placeholderTextColor="#777" onFocus={() => scrollVariantEditorTo(390)} />
                   <Text style={styles.inputLabel}>Description:</Text>
-                  <TextInput style={[styles.modalInput, styles.descriptionInput]} value={activeVariantDescription} onChangeText={setActiveVariantDescription} multiline placeholder="Description for this material" placeholderTextColor="#777" />
+                  <TextInput style={[styles.modalInput, styles.descriptionInput]} value={activeVariantDescription} onChangeText={setActiveVariantDescription} multiline placeholder="Description for this material" placeholderTextColor="#777" onFocus={() => scrollVariantEditorTo(455)} />
                   <TouchableOpacity style={styles.hardDeleteConfirmRow} onPress={() => setActiveVariantForceShowDescription((v) => !v)}>
                     <Text style={[styles.hardDeleteCheckbox, { color: '#0a192f' }]}>{activeVariantForceShowDescription ? '☑' : '☐'}</Text>
                     <Text style={[styles.hardDeleteWarning, { color: '#0a192f' }]}>Always show description during selection</Text>
@@ -1399,8 +1426,12 @@ const styles = StyleSheet.create({
   itemUnits: { fontSize: 11, color: '#64ffda', marginTop: 3 },
   editIcon: { fontSize: 20 },
   modalOverlay: { flex: 1, backgroundColor: 'rgba(2, 12, 27, 0.8)' },
-  modalSafeArea: { flex: 1, justifyContent: 'center', paddingHorizontal: 12 },
+  modalSafeArea: { flex: 1, justifyContent: 'center', paddingHorizontal: 12, paddingBottom: 10 },
+  modalSafeAreaKeyboard: { justifyContent: 'flex-start', paddingTop: 8, paddingBottom: 4 },
+  keyboardAvoider: { flex: 1, width: '100%' },
   modalContent: { backgroundColor: '#ccd6f6', maxHeight: '92%', padding: 20, borderRadius: 15 },
+  keyboardModalContent: { maxHeight: '100%', marginTop: 0, paddingBottom: 10 },
+  editModalScrollContent: { paddingBottom: 96 },
   modalTitle: { fontSize: 15, fontWeight: 'bold', color: '#0a192f', textAlign: 'center' },
   modalSubtitle: { fontSize: 11, color: '#334155', textAlign: 'center', marginTop: 5 },
   modalImage: { width: 170, height: 170, borderRadius: 14, alignSelf: 'center', marginVertical: 12, backgroundColor: '#fff' },
@@ -1437,7 +1468,8 @@ const styles = StyleSheet.create({
     paddingHorizontal: 20,
     paddingBottom: 0,
   },
-  variantEditorScrollContent: { paddingBottom: 34 },
+  keyboardVariantEditorModal: { maxHeight: '100%', marginTop: 0, marginBottom: 0, paddingTop: 12 },
+  variantEditorScrollContent: { paddingBottom: 120 },
   deleteButton: { marginTop: 20, padding: 12, borderRadius: 8, borderWidth: 1, borderColor: '#e74c3c', alignItems: 'center', backgroundColor: '#fff' },
   deleteButtonText: { color: '#e74c3c', fontWeight: 'bold', fontSize: 13 },
   hardDeleteBox: { marginTop: 12, padding: 12, borderRadius: 10, backgroundColor: '#fee2e2', borderWidth: 1, borderColor: '#ef4444' },
