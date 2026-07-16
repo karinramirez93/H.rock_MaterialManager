@@ -14,6 +14,7 @@ import CatalogManagerScreen from './src/screens/CatalogManagerScreen';
 import ImportantInfoScreen from './src/screens/ImportantInfoScreen';
 import AuthScreen from './src/screens/AuthScreen';
 import ProfileScreen from './src/screens/ProfileScreen';
+import CableRequirementsScreen from './src/screens/CableRequirementsScreen';
 import HomeHeaderButton from './src/components/HomeHeaderButton';
 import { AuthService } from './src/database/authService';
 
@@ -144,6 +145,9 @@ export default function App() {
             </Stack.Screen>
             <Stack.Screen name="ImportantInfo" options={{ title: 'Important Info' }}>
               {(props) => <ImportantInfoScreen {...props} currentUser={currentUser} />}
+            </Stack.Screen>
+            <Stack.Screen name="CableRequirements" options={{ title: 'Cable & Wire Requirements' }}>
+              {(props) => <CableRequirementsScreen {...props} currentUser={currentUser} />}
             </Stack.Screen>
             <Stack.Screen name="Profile" options={{ title: 'User Profile' }}>
               {(props) => <ProfileScreen {...props} onSignOut={() => setCurrentUser(null)} />}

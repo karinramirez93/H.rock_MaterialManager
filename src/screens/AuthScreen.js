@@ -8,7 +8,7 @@
  * - Create an account with one Name field. That name also becomes the username.
  * - Continue as Guest with viewer-only permissions.
  *
- * Guest users can view the catalog, create a temporary Material Quantity Sheet,
+ * Guest users can view the catalog, create a temporary Material Requirements,
  * and share it, but they cannot edit shared Firebase catalog data.
  */
 import React, { useState } from 'react';

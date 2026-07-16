@@ -10,7 +10,8 @@
     "expo-file-system": "~56.0.8",
     "expo-image-manipulator": "~56.0.20",
     "expo-image-picker": "~56.0.19",
-    "expo-sharing": "~56.0.19",
+    "expo-print": "~56.0.4",
+    "expo-sharing": "~56.0.22",
     "expo-sqlite": "56.0.5",
     "expo-status-bar": "56.0.4",
     "firebase": "^12.15.0",
@@ -19,7 +20,8 @@
     "react-native-gesture-handler": "~2.31.1",
     "react-native-reanimated": "4.3.1",
     "react-native-safe-area-context": "5.7.0",
-    "react-native-screens": "4.25.2"
+    "react-native-screens": "4.25.2",
+    "react-native-view-shot": "^5.1.1"
   },
   "scripts": {
     "start": "expo start",

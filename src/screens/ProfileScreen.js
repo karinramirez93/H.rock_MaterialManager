@@ -43,7 +43,7 @@ export default function ProfileScreen({ onSignOut }) {
         {user?.isGuest ? (
           <View style={styles.guestCard}>
             <Text style={styles.guestTitle}>Guest Mode</Text>
-            <Text style={styles.guestText}>You can view the catalog, create a Material Quantity Sheet, and send it. Shared catalog editing is disabled.</Text>
+            <Text style={styles.guestText}>You can view the catalog, create a Material Requirements, and send it. Shared catalog editing is disabled.</Text>
           </View>
         ) : null}
 

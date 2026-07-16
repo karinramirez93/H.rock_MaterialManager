@@ -32,6 +32,8 @@ const CATALOG_CACHE_KEY = '@material_catalog_cache_v3';
 const SQLITE_DATABASE_NAME = 'material_catalog_local_cache.db';
 const CATALOG_TABLE_NAME = 'catalog_materials';
 const IMPORTANT_INFO_TABLE_NAME = 'important_info_items';
+const CABLE_CATALOG_TABLE_NAME = 'cable_catalog_items';
+const CABLE_REQUIREMENT_TABLE_NAME = 'cable_requirement_drafts';
 const LOCAL_IMAGE_CACHE_ROOT = `${FileSystem.documentDirectory || ''}hrocker-image-cache/`;
 const CATALOG_IMAGE_CACHE_DIR = `${LOCAL_IMAGE_CACHE_ROOT}catalog/`;
 const IMPORTANT_INFO_IMAGE_CACHE_DIR = `${LOCAL_IMAGE_CACHE_ROOT}important-info/`;
@@ -73,6 +75,12 @@ const MATERIALS_ENDPOINT = `${FIREBASE_DATABASE_URL}/materials.json`;
 const CATEGORIES_ENDPOINT = `${FIREBASE_DATABASE_URL}/categories.json`;
 const UNIT_MEASURES_ENDPOINT = `${FIREBASE_DATABASE_URL}/unitMeasures.json`;
 const IMPORTANT_INFO_ENDPOINT = `${FIREBASE_DATABASE_URL}/importantInfo.json`;
+const CABLE_CATALOG_ENDPOINT = `${FIREBASE_DATABASE_URL}/cableCatalog.json`;
+const CABLE_REQUIREMENTS_ENDPOINT = `${FIREBASE_DATABASE_URL}/cableRequirementDrafts`;
+const CABLE_CATALOG_CACHE_KEY = '@cable_catalog_cache_v1';
+const CABLE_REQUIREMENT_DRAFT_KEY = '@cable_requirement_draft_v1';
+const CABLE_CATALOG_META_KEY = '@cable_catalog_meta_v1';
+const CABLE_CATALOG_META_ENDPOINT = `${FIREBASE_DATABASE_URL}/meta/cableCatalog.json`;
 const CATALOG_META_ENDPOINT = `${FIREBASE_DATABASE_URL}/meta/catalog.json`;
 const CATALOG_STORAGE_FOLDER = 'catalog-thumbnails';
 // Important Info keeps full-quality reference photos. The catalog only stores
@@ -891,6 +899,17 @@ const getSQLiteDatabase = async () => {
         data TEXT NOT NULL,
         updatedAt TEXT,
         deleted INTEGER DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS ${CABLE_CATALOG_TABLE_NAME} (
+        id TEXT PRIMARY KEY NOT NULL,
+        data TEXT NOT NULL,
+        updatedAt TEXT,
+        deleted INTEGER DEFAULT 0
+      );
+      CREATE TABLE IF NOT EXISTS ${CABLE_REQUIREMENT_TABLE_NAME} (
+        id TEXT PRIMARY KEY NOT NULL,
+        data TEXT NOT NULL,
+        updatedAt TEXT
       );
     `);
   }
@@ -2412,5 +2431,229 @@ export const StorageService = {
       console.error('StorageService Error (reclaimDiskSpace):', error);
       return false;
     }
-  }
+  },
+
+  /**
+   * Loads the current user's cable/wire requirement draft. The local copy opens
+   * instantly; Firebase is used as a lightweight backup/shared source.
+   */
+  async loadCableRequirementDraft() {
+    const user = await AuthService.getCurrentUser();
+    const userKey = String(user?.uid || user?.email || 'guest').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const localKey = `${CABLE_REQUIREMENT_DRAFT_KEY}_${userKey}`;
+    try {
+      const localText = await AsyncStorage.getItem(localKey);
+      if (localText) return JSON.parse(localText);
+
+      const database = await getSQLiteDatabase();
+      const row = await database.getFirstAsync(
+        `SELECT data FROM ${CABLE_REQUIREMENT_TABLE_NAME} WHERE id = ? LIMIT 1;`,
+        [userKey]
+      );
+      return row?.data ? JSON.parse(row.data) : null;
+    } catch (error) {
+      console.warn('Cable requirement local draft warning:', error);
+      return null;
+    }
+  },
+
+  /**
+   * Cable/Wire requirement sheets are working drafts, so they stay local.
+   * Typing, changing a length, deleting a row, or generating a report must not
+   * create Firebase traffic. Firebase is contacted only when the reusable
+   * cable catalog itself changes or during the lightweight catalog version check.
+   */
+  async saveCableRequirementDraft(draft) {
+    const user = await AuthService.getCurrentUser();
+    const userKey = String(user?.uid || user?.email || 'guest').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const localKey = `${CABLE_REQUIREMENT_DRAFT_KEY}_${userKey}`;
+    const normalized = {
+      projectName: String(draft?.projectName || ''),
+      requestedBy: String(draft?.requestedBy || ''),
+      items: Array.isArray(draft?.items) ? draft.items : [],
+      updatedAt: draft?.updatedAt || new Date().toISOString(),
+      version: Number(draft?.version || 1),
+    };
+    await AsyncStorage.setItem(localKey, JSON.stringify(normalized));
+    const database = await getSQLiteDatabase();
+    await database.runAsync(
+      `INSERT OR REPLACE INTO ${CABLE_REQUIREMENT_TABLE_NAME} (id, data, updatedAt) VALUES (?, ?, ?);`,
+      [userKey, JSON.stringify(normalized), normalized.updatedAt]
+    );
+    return normalized;
+  },
+
+  async loadCableCatalogCache() {
+    try {
+      const database = await getSQLiteDatabase();
+      const rows = await database.getAllAsync(`SELECT data FROM ${CABLE_CATALOG_TABLE_NAME} WHERE deleted = 0 ORDER BY updatedAt DESC;`);
+      if (rows?.length) return rows.map((row) => JSON.parse(row.data));
+      const text = await AsyncStorage.getItem(CABLE_CATALOG_CACHE_KEY);
+      return text ? JSON.parse(text) : [];
+    } catch (error) {
+      console.warn('Cable catalog cache warning:', error);
+      return [];
+    }
+  },
+
+  async syncCableCatalog({ force = false } = {}) {
+    const localCatalog = await this.loadCableCatalogCache();
+    try {
+      // Only download a tiny metadata record first. If its version/timestamp is
+      // unchanged, the complete cable catalog never leaves Firebase.
+      const localMetaText = await AsyncStorage.getItem(CABLE_CATALOG_META_KEY);
+      const localMeta = localMetaText ? JSON.parse(localMetaText) : null;
+      const metaUrl = await buildOptionalAuthenticatedFirebaseUrl(CABLE_CATALOG_META_ENDPOINT);
+      const metaResponse = await fetch(metaUrl);
+      const remoteMeta = metaResponse.ok ? await metaResponse.json() : null;
+
+      const unchanged = !force && localCatalog.length > 0 && remoteMeta && localMeta
+        && String(remoteMeta.version || '') === String(localMeta.version || '')
+        && String(remoteMeta.latestUpdatedAt || '') === String(localMeta.latestUpdatedAt || '');
+
+      if (unchanged) {
+        return localCatalog.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+      }
+
+      const url = await buildOptionalAuthenticatedFirebaseUrl(CABLE_CATALOG_ENDPOINT);
+      const response = await fetch(url);
+      if (!response.ok) return localCatalog;
+      const payload = await response.json();
+      const remoteCatalog = Object.entries(payload || {})
+        .map(([id, value]) => ({ id, ...value }))
+        .filter((item) => !item.deletedAt);
+
+      await AsyncStorage.setItem(CABLE_CATALOG_CACHE_KEY, JSON.stringify(remoteCatalog));
+      await AsyncStorage.setItem(CABLE_CATALOG_META_KEY, JSON.stringify(remoteMeta || {
+        version: remoteCatalog.length,
+        latestUpdatedAt: remoteCatalog.reduce((latest, item) => String(item.updatedAt || '') > latest ? String(item.updatedAt || '') : latest, ''),
+      }));
+      const database = await getSQLiteDatabase();
+      await database.runAsync(`DELETE FROM ${CABLE_CATALOG_TABLE_NAME};`);
+      for (const entry of remoteCatalog) {
+        await database.runAsync(
+          `INSERT OR REPLACE INTO ${CABLE_CATALOG_TABLE_NAME} (id, data, updatedAt, deleted) VALUES (?, ?, ?, 0);`,
+          [entry.id, JSON.stringify(entry), entry.updatedAt || '']
+        );
+      }
+      return remoteCatalog.sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    } catch (error) {
+      console.warn('Cable catalog sync warning:', error);
+      return localCatalog;
+    }
+  },
+
+  async saveCableCatalogEntry(entry) {
+    await ensureSharedDataEditor();
+
+    const normalizeCableWireCatalogName = (value) => String(value || '')
+      .trim()
+      .toUpperCase()
+      .replace(/[“”]/g, '"')
+      .replace(/\s+/g, ' ')
+      .replace(/(\d+)\s*C(?=\s|#|-|\d|$)/g, '$1 C')
+      .replace(/\s*#\s*/g, ' # ')
+      .replace(/\s*-\s*/g, ' - ')
+      .replace(/\s+/g, ' ')
+      .replace(/^#\s*/, '# ')
+      .trim();
+
+    const cleanName = normalizeCableWireCatalogName(entry?.name);
+    const type = entry?.type === 'wire' ? 'wire' : 'cable';
+    if (!cleanName) throw new Error('CABLE_NAME_REQUIRED');
+
+    const currentCatalog = await this.loadCableCatalogCache();
+    const requestedId = String(entry?.id || '').trim();
+    const generatedId = `${type}-${cleanName.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')}`;
+    const id = requestedId || generatedId;
+
+    const duplicate = currentCatalog.find((item) =>
+      item.id !== id
+      && item.type === type
+      && normalizeCableWireCatalogName(item.name).replace(/\s+/g, '') === cleanName.replace(/\s+/g, '')
+    );
+    if (duplicate) throw new Error('CABLE_CATALOG_NAME_ALREADY_EXISTS');
+
+    const existingRecord = currentCatalog.find((item) => item.id === id);
+    const userLabel = await getCurrentAuditUserLabel();
+    const now = new Date().toISOString();
+    const record = {
+      ...(existingRecord || {}),
+      id,
+      type,
+      name: cleanName,
+      updatedAt: now,
+      updatedBy: userLabel,
+      version: Number(existingRecord?.version || 0) + 1,
+      deletedAt: null,
+    };
+
+    const url = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/cableCatalog/${id}.json`);
+    const response = await fetch(url, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(record),
+    });
+    if (!response.ok) throw new Error(`Firebase cable catalog save failed: ${response.status}`);
+
+    const nextCatalog = [...currentCatalog.filter((item) => item.id !== id), record]
+      .sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    await AsyncStorage.setItem(CABLE_CATALOG_CACHE_KEY, JSON.stringify(nextCatalog));
+
+    const database = await getSQLiteDatabase();
+    await database.runAsync(
+      `INSERT OR REPLACE INTO ${CABLE_CATALOG_TABLE_NAME} (id, data, updatedAt, deleted) VALUES (?, ?, ?, 0);`,
+      [record.id, JSON.stringify(record), record.updatedAt]
+    );
+
+    const oldMetaText = await AsyncStorage.getItem(CABLE_CATALOG_META_KEY);
+    const oldMeta = oldMetaText ? JSON.parse(oldMetaText) : {};
+    const nextVersion = Number(oldMeta.version || oldMeta.latestVersion || 0) + 1;
+    const nextMeta = {
+      version: nextVersion,
+      latestVersion: nextVersion,
+      latestUpdatedAt: now,
+    };
+    const metaUrl = await buildAuthenticatedFirebaseUrl(CABLE_CATALOG_META_ENDPOINT);
+    const metaResponse = await fetch(metaUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(nextMeta),
+    });
+    if (!metaResponse.ok) {
+      console.warn(`Cable catalog metadata update warning: ${metaResponse.status}`);
+    }
+    await AsyncStorage.setItem(CABLE_CATALOG_META_KEY, JSON.stringify(nextMeta));
+    return nextCatalog;
+  },
+
+  async deleteCableCatalogEntry(entryId) {
+    await ensureSharedDataEditor();
+    const currentCatalog = await this.loadCableCatalogCache();
+    if (!entryId) return currentCatalog;
+    const userLabel = await getCurrentAuditUserLabel();
+    const now = new Date().toISOString();
+    const url = await buildAuthenticatedFirebaseUrl(`${FIREBASE_DATABASE_URL}/cableCatalog/${entryId}.json`);
+    const response = await fetch(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ deletedAt: now, deletedBy: userLabel, updatedAt: now }),
+    });
+    if (!response.ok) throw new Error(`Firebase cable catalog delete failed: ${response.status}`);
+
+    const nextCatalog = currentCatalog.filter((item) => item.id !== entryId);
+    await AsyncStorage.setItem(CABLE_CATALOG_CACHE_KEY, JSON.stringify(nextCatalog));
+    const database = await getSQLiteDatabase();
+    await database.runAsync(`DELETE FROM ${CABLE_CATALOG_TABLE_NAME} WHERE id = ?;`, [entryId]);
+
+    const oldMetaText = await AsyncStorage.getItem(CABLE_CATALOG_META_KEY);
+    const oldMeta = oldMetaText ? JSON.parse(oldMetaText) : {};
+    const nextVersion = Number(oldMeta.version || oldMeta.latestVersion || 0) + 1;
+    const nextMeta = { version: nextVersion, latestVersion: nextVersion, latestUpdatedAt: now };
+    const metaUrl = await buildAuthenticatedFirebaseUrl(CABLE_CATALOG_META_ENDPOINT);
+    await fetch(metaUrl, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(nextMeta) });
+    await AsyncStorage.setItem(CABLE_CATALOG_META_KEY, JSON.stringify(nextMeta));
+    return nextCatalog;
+  },
+
 };

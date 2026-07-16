@@ -1,7 +1,7 @@
 /**
  * DraftScreen
  * -----------
- * Main screen of the app. It contains the active Material Quantity Sheet,
+ * Main screen of the app. It contains the active Material Requirements,
  * project header fields, row consolidation, alphabetical sorting, deletion,
  * clearing, and sharing through the device share sheet.
  *
@@ -9,12 +9,16 @@
  * catalog descriptions stay in the catalog so the final material list remains
  * simple and lightweight.
  */
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { StyleSheet, Text, View, TextInput, ScrollView, TouchableOpacity, Alert, ActivityIndicator, Share, Modal, BackHandler } from 'react-native';
 import { StorageService } from '../database/storage';
 import { StatusBar } from 'expo-status-bar';
 import { useIsFocused } from '@react-navigation/native';
 import { SafeAreaView } from 'react-native-safe-area-context';
+import ViewShot from 'react-native-view-shot';
+import * as Sharing from 'expo-sharing';
+import * as Print from 'expo-print';
+import * as FileSystem from 'expo-file-system/legacy';
 
 export default function DraftScreen({ navigation, route, currentUser }) {
   const [buildingName, setBuildingName] = useState('');
@@ -22,6 +26,10 @@ export default function DraftScreen({ navigation, route, currentUser }) {
   const [items, setItems] = useState([]);
   const [isLoaded, setIsLoaded] = useState(false);
   const [mainMenuVisible, setMainMenuVisible] = useState(false);
+  const [quantityImagePreviewVisible, setQuantityImagePreviewVisible] = useState(false);
+  const [isGeneratingQuantityImage, setIsGeneratingQuantityImage] = useState(false);
+  const [isGeneratingQuantityPdf, setIsGeneratingQuantityPdf] = useState(false);
+  const quantitySheetImageRef = useRef(null);
 
   // One-time material states. These values are only used for the active requisition.
   // They are never sent to Firebase and never become part of the shared catalog.
@@ -75,13 +83,18 @@ export default function DraftScreen({ navigation, route, currentUser }) {
 
   // Handles the Android system Back button on the main screen.
   // If a modal is open, Back closes it first. If no modal is open, the user is
-  // asked before exiting the app so the active Material Quantity Sheet is not
+  // asked before exiting the app so the active Material Requirements is not
   // lost by accident. The temporary requisition still remains saved locally
   // until the user manually clears the table.
   useEffect(() => {
     const handleDeviceBack = () => {
       if (mainMenuVisible) {
         setMainMenuVisible(false);
+        return true;
+      }
+
+      if (quantityImagePreviewVisible) {
+        setQuantityImagePreviewVisible(false);
         return true;
       }
 
@@ -99,7 +112,7 @@ export default function DraftScreen({ navigation, route, currentUser }) {
         'Exit App?',
         currentUser?.isGuest
           ? 'Guest drafts are temporary and may be lost when the app is closed. Sign in or create an account if you want to keep your active draft.'
-          : 'Your current Material Quantity Sheet will stay saved only for your account on this device until you clear it manually.',
+          : 'Your current Material Requirements will stay saved only for your account on this device until you clear it manually.',
         [
           { text: 'Cancel', style: 'cancel' },
           { text: 'Exit', style: 'destructive', onPress: () => BackHandler.exitApp() }
@@ -110,7 +123,7 @@ export default function DraftScreen({ navigation, route, currentUser }) {
 
     const subscription = BackHandler.addEventListener('hardwareBackPress', handleDeviceBack);
     return () => subscription.remove();
-  }, [mainMenuVisible, oneTimeModalVisible, editModalVisible, currentUser]);
+  }, [mainMenuVisible, quantityImagePreviewVisible, oneTimeModalVisible, editModalVisible, currentUser]);
 
   // Helper function that sorts material rows alphabetically by material name. This keeps the exported list clean and predictable.
   const sortItemsByName = (array) => {
@@ -368,7 +381,7 @@ export default function DraftScreen({ navigation, route, currentUser }) {
     setOneTimeQuantity(String(Math.max(1, current - 1)));
   };
 
-  // Adds a one-time material directly to the current Material Quantity Sheet.
+  // Adds a one-time material directly to the current Material Requirements.
   // This is useful when a material is needed once but should not be saved in the global Firebase catalog.
   const addOneTimeMaterialToList = async () => {
     const cleanName = oneTimeName.trim();
@@ -422,41 +435,148 @@ export default function DraftScreen({ navigation, route, currentUser }) {
     ]);
   };
 
-  // Structured sending of clean reports to WhatsApp or Messaging
-  const shareListViaMessaging = async () => {
+  // Opens a clean image preview before sharing the Material Requirements.
+  // The working table remains unchanged; only the generated document is shared.
+  const openQuantityImagePreview = () => {
     if (items.length === 0) {
-      Alert.alert("Empty Table", "Please add materials to export and send.");
+      Alert.alert('Empty Table', 'Please add materials before generating the image.');
       return;
     }
+    setQuantityImagePreviewVisible(true);
+  };
 
-    const materialLines = items.map((item, idx) => {
-      const notes = item.description ? ` [Note: ${item.description}]` : '';
-      if (isLengthUnit(item.unit)) {
-        return `• ${item.material?.name} - ${getLengthMessageText(item)}${notes}`;
-      }
-      const specs = item.lengthDetail ? ` (${item.lengthDetail})` : '';
-      return `• ${item.material?.name}${specs} - ${item.quantity} ${getDisplayUnit(item.unit, item.quantity)}${notes}`;
-    }).join('\n');
+  const escapeReportHtml = (value) => String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
 
-    const message = `📋 *ELECTRICAL MATERIALS REQUISITION*\n\n` +
-                    `🏢 *Project/Building:* ${buildingName || 'Not specified'}\n` +
-                    `👤 *Created By:* ${creatorName || 'Not specified'}\n\n` +
-                    `*Organized Materials List:* \n${materialLines}`;
+  const buildMaterialRequirementsPdfHtml = () => {
+    const rows = items.map((item, index) => {
+      const detailParts = [];
+      if (item.lengthDetail) detailParts.push(isLengthUnit(item.unit) ? getLengthDisplayText(item) : item.lengthDetail);
+      if (item.description) detailParts.push(item.description);
+      const quantity = isLengthUnit(item.unit) ? '—' : item.quantity;
+      const unit = isLengthUnit(item.unit) ? getLengthDisplayText(item) : getDisplayUnit(item.unit, item.quantity);
+      return `
+        <tr>
+          <td class="number">${index + 1}</td>
+          <td class="description"><strong>${escapeReportHtml(item.material?.name || 'Material')}</strong>${detailParts.length ? `<small>${escapeReportHtml(detailParts.join(' • '))}</small>` : ''}</td>
+          <td class="qty">${escapeReportHtml(quantity)}</td>
+          <td class="unit">${escapeReportHtml(unit)}</td>
+        </tr>`;
+    }).join('');
 
+    return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>
+      @page { size: Letter; margin: 24px; }
+      * { box-sizing: border-box; }
+      body { margin: 0; font-family: Arial, Helvetica, sans-serif; color: #111827; background: #fff; }
+      .document { border: 1px solid #94a3b8; border-radius: 10px; overflow: hidden; }
+      .hero { min-height: 112px; background: #052a4a; color: white; padding: 20px 24px; display: flex; align-items: center; justify-content: space-between; }
+      .hero h1 { margin: 0; max-width: 78%; font-size: 30px; line-height: 1.05; font-weight: 900; letter-spacing: .4px; }
+      .underline { width: 92px; height: 4px; margin-top: 10px; background: #0ea5e9; }
+      .icon { width: 90px; text-align: center; color: #38bdf8; font-weight: 900; font-size: 11px; }
+      .icon .bolt { font-size: 42px; display: block; }
+      .meta { padding: 18px 24px 8px; }
+      .meta-label { color: #092f55; font-size: 12px; font-weight: 900; margin-top: 8px; }
+      .meta-value { min-height: 28px; padding: 5px 2px; border-bottom: 1px solid #94a3b8; font-size: 14px; }
+      .table-wrap { margin: 16px 18px 22px; border: 1px solid #94a3b8; border-radius: 8px; overflow: hidden; }
+      .section-title { background: #052a4a; color: #fff; text-align: center; font-size: 18px; font-weight: 900; padding: 10px; }
+      table { width: 100%; border-collapse: collapse; table-layout: fixed; }
+      th { background: #07345d; color: #fff; font-size: 11px; font-weight: 900; padding: 10px 6px; border-right: 1px solid #94a3b8; border-bottom: 2px solid #94a3b8; }
+      td { min-height: 44px; padding: 10px 7px; font-size: 12px; text-align: center; border-right: 1px solid #94a3b8; border-bottom: 2px solid #94a3b8; overflow-wrap: anywhere; }
+      tr:last-child td { border-bottom: 0; }
+      th:last-child, td:last-child { border-right: 0; }
+      .number { width: 15%; font-weight: 900; }
+      td.number { color: #0b4a83; }
+      .description { width: 49%; text-align: left; }
+      .description strong { display: block; font-size: 12px; }
+      .description small { display: block; color: #475569; font-size: 10px; margin-top: 3px; }
+      .qty { width: 14%; }
+      .unit { width: 22%; }
+      thead { display: table-header-group; }
+      tr { page-break-inside: avoid; }
+    </style></head><body><div class="document">
+      <div class="hero"><div><h1>MATERIAL REQUIREMENTS</h1><div class="underline"></div></div><div class="icon"><span class="bolt">⚡</span>MATERIALS</div></div>
+      <div class="meta"><div class="meta-label">▣ PROJECT / JOB NAME:</div><div class="meta-value">${escapeReportHtml(buildingName || ' ')}</div><div class="meta-label">● REQUESTED BY:</div><div class="meta-value">${escapeReportHtml(creatorName || ' ')}</div></div>
+      <div class="table-wrap"><div class="section-title">MATERIAL REQUIREMENTS</div><table><thead><tr><th class="number">ITEM NO.</th><th class="description">ITEM DESCRIPTION</th><th class="qty">QTY.</th><th class="unit">UNIT</th></tr></thead><tbody>${rows}</tbody></table></div>
+    </div></body></html>`;
+  };
+
+  const shareMaterialRequirementsPdf = async () => {
+    if (!items.length) {
+      Alert.alert('Empty Table', 'Please add materials before generating the PDF.');
+      return;
+    }
+    setIsGeneratingQuantityPdf(true);
     try {
-      await Share.share({ message });
-
-      // Once the material request has been sent/shared, the current sheet is cleared
-      // so the user can immediately start a new request without manually clearing it.
-      setItems([]);
-      await StorageService.saveDraft({
-        buildingName,
-        creatorName,
-        creatorSessionKey: getCurrentCreatorSessionKey(),
-        items: []
+      const { base64: pdfBase64 } = await Print.printToFileAsync({
+        html: buildMaterialRequirementsPdfHtml(),
+        base64: true,
       });
-    } catch (e) {
-      console.error("Error sharing report:", e);
+
+      // Expo Go can return a temporary Print URI that FileSystem and Sharing
+      // cannot read. The returned base64 lets us create a fresh PDF inside the
+      // app cache without trying to copy that inaccessible temporary file.
+      if (!pdfBase64) {
+        throw new Error('MATERIAL_REQUIREMENTS_PDF_BASE64_MISSING');
+      }
+
+      const shareableUri = `${FileSystem.cacheDirectory}material-requirements-${Date.now()}.pdf`;
+      await FileSystem.writeAsStringAsync(shareableUri, pdfBase64, {
+        encoding: FileSystem.EncodingType.Base64,
+      });
+
+      const pdfInfo = await FileSystem.getInfoAsync(shareableUri, { size: true });
+      if (!pdfInfo.exists || !pdfInfo.size) {
+        throw new Error('MATERIAL_REQUIREMENTS_PDF_CACHE_WRITE_FAILED');
+      }
+
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(shareableUri, {
+          mimeType: 'application/pdf',
+          dialogTitle: 'Share material requirements PDF',
+          UTI: 'com.adobe.pdf',
+        });
+      } else {
+        Alert.alert('PDF created', `The PDF was created at: ${shareableUri}`);
+      }
+    } catch (error) {
+      console.error('Error generating material requirements PDF:', error);
+      Alert.alert('Unable to generate PDF', 'Confirm that expo-print and expo-sharing are installed, then rebuild or restart the app.');
+    } finally {
+      setIsGeneratingQuantityPdf(false);
+    }
+  };
+
+  const shareQuantitySheetImage = async () => {
+    if (!quantitySheetImageRef.current) return;
+    setIsGeneratingQuantityImage(true);
+    try {
+      // Give the modal one frame to finish laying out before capture.
+      await new Promise((resolve) => setTimeout(resolve, 180));
+      const uri = await quantitySheetImageRef.current.capture();
+      if (!uri) throw new Error('QUANTITY_IMAGE_CAPTURE_FAILED');
+
+      if (await Sharing.isAvailableAsync()) {
+        await Sharing.shareAsync(uri, {
+          mimeType: 'image/png',
+          dialogTitle: 'Share material quantity sheet',
+          UTI: 'public.png',
+        });
+      } else {
+        const message = `Material Requirements\nProject: ${buildingName || 'Not specified'}\nRequested by: ${creatorName || 'Not specified'}`;
+        await Share.share({ message });
+      }
+    } catch (error) {
+      console.error('Error generating quantity sheet image:', error);
+      Alert.alert(
+        'Unable to generate image',
+        'Confirm that react-native-view-shot and expo-sharing are installed, then rebuild or restart the app.'
+      );
+    } finally {
+      setIsGeneratingQuantityImage(false);
     }
   };
 
@@ -510,7 +630,7 @@ export default function DraftScreen({ navigation, route, currentUser }) {
 
         {/* EXCEL-STYLE HORIZONTAL TABLE DESIGN */}
         <View style={styles.tableCard}>
-          <Text style={styles.tableTitle}>MATERIAL QUANTITY SHEET</Text>
+          <Text style={styles.tableTitle}>MATERIAL REQUIREMENTS</Text>
 
           {/* Horizontal Cell Header */}
           <View style={styles.tableHeader}>
@@ -578,8 +698,12 @@ export default function DraftScreen({ navigation, route, currentUser }) {
 
         {items.length > 0 && (
           <View>
-            <TouchableOpacity style={styles.btnShare} onPress={shareListViaMessaging}>
-              <Text style={styles.btnText}>📤 SEND REQUISITION (WHATSAPP / SMS)</Text>
+            <TouchableOpacity style={styles.btnShare} onPress={openQuantityImagePreview}>
+              <Text style={styles.btnText}>🖼️ PREVIEW & SHARE MATERIAL IMAGE</Text>
+            </TouchableOpacity>
+
+            <TouchableOpacity style={[styles.btnPdf, isGeneratingQuantityPdf && styles.quantityPreviewButtonDisabled]} onPress={shareMaterialRequirementsPdf} disabled={isGeneratingQuantityPdf}>
+              <Text style={styles.btnText}>{isGeneratingQuantityPdf ? 'GENERATING PDF...' : '📄 GENERATE & SHARE PDF'}</Text>
             </TouchableOpacity>
 
             <TouchableOpacity style={styles.btnDanger} onPress={clearList}>
@@ -588,6 +712,129 @@ export default function DraftScreen({ navigation, route, currentUser }) {
           </View>
         )}
       </ScrollView>
+
+      {/* Material Requirements image preview. The ViewShot captures only this clean document. */}
+      <Modal
+        visible={quantityImagePreviewVisible}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setQuantityImagePreviewVisible(false)}
+      >
+        <View style={styles.quantityPreviewOverlay}>
+          <SafeAreaView style={styles.quantityPreviewSafeArea} edges={['top', 'bottom']}>
+            <View style={styles.quantityPreviewCard}>
+              <View style={styles.quantityPreviewTopBar}>
+                <View style={{ width: 42 }} />
+                <Text style={styles.quantityPreviewTitle}>Material Image Preview</Text>
+                <TouchableOpacity
+                  style={styles.quantityPreviewClose}
+                  onPress={() => setQuantityImagePreviewVisible(false)}
+                >
+                  <Text style={styles.quantityPreviewCloseText}>✕</Text>
+                </TouchableOpacity>
+              </View>
+
+              <ScrollView
+                style={styles.quantityPreviewScroll}
+                contentContainerStyle={styles.quantityPreviewScrollContent}
+                showsVerticalScrollIndicator
+              >
+                <ViewShot
+                  ref={quantitySheetImageRef}
+                  options={{ format: 'png', quality: 1, result: 'tmpfile' }}
+                  style={styles.quantityCaptureWrapper}
+                >
+                  <View style={styles.quantityDocument}>
+                    <View style={styles.quantityDocumentHero}>
+                      <View style={styles.quantityDocumentHeroTextWrap}>
+                        <Text
+                          style={styles.quantityDocumentHeroTitle}
+                          numberOfLines={2}
+                          adjustsFontSizeToFit
+                          minimumFontScale={0.7}
+                        >
+                          MATERIAL REQUIREMENTS
+                        </Text>
+                        <View style={styles.quantityDocumentUnderline} />
+                      </View>
+                      <View style={styles.quantityDocumentIconWrap}>
+                        <Text style={styles.quantityDocumentIcon}>⚡</Text>
+                        <Text style={styles.quantityDocumentIconLabel}>MATERIALS</Text>
+                      </View>
+                    </View>
+
+                    <View style={styles.quantityDocumentMeta}>
+                      <Text style={styles.quantityDocumentMetaLabel}>▣  PROJECT / JOB NAME:</Text>
+                      <Text style={styles.quantityDocumentMetaValue}>{buildingName || ' '}</Text>
+                      <Text style={styles.quantityDocumentMetaLabel}>●  REQUESTED BY:</Text>
+                      <Text style={styles.quantityDocumentMetaValue}>{creatorName || ' '}</Text>
+                    </View>
+
+                    <View style={styles.quantityDocumentTable}>
+                      <View style={styles.quantityDocumentSectionTitle}>
+                        <Text style={styles.quantityDocumentSectionTitleText}>MATERIAL REQUIREMENTS</Text>
+                      </View>
+                      <View style={styles.quantityDocumentTableHeader}>
+                        <Text style={[styles.quantityDocHeaderCell, styles.quantityDocNumberColumn]}>ITEM NO.</Text>
+                        <Text style={[styles.quantityDocHeaderCell, styles.quantityDocDescriptionColumn]}>ITEM DESCRIPTION</Text>
+                        <Text style={[styles.quantityDocHeaderCell, styles.quantityDocQtyColumn]}>QTY.</Text>
+                        <Text style={[styles.quantityDocHeaderCell, styles.quantityDocUnitColumn]}>UNIT</Text>
+                      </View>
+                      {items.map((item, index) => {
+                        const detailParts = [];
+                        if (item.lengthDetail) {
+                          detailParts.push(isLengthUnit(item.unit) ? getLengthDisplayText(item) : item.lengthDetail);
+                        }
+                        if (item.description) detailParts.push(item.description);
+                        return (
+                          <View key={`quantity-image-${index}`} style={styles.quantityDocumentTableRow}>
+                            <Text style={[styles.quantityDocBodyCell, styles.quantityDocNumberColumn, styles.quantityDocItemNumber]}>{index + 1}</Text>
+                            <View style={[styles.quantityDocDescriptionBody, styles.quantityDocDescriptionColumn]}>
+                              <Text style={styles.quantityDocMaterialName}>{item.material?.name || 'Material'}</Text>
+                              {!!detailParts.length && <Text style={styles.quantityDocMaterialDetail}>{detailParts.join(' • ')}</Text>}
+                            </View>
+                            <Text style={[styles.quantityDocBodyCell, styles.quantityDocQtyColumn]}>{isLengthUnit(item.unit) ? '—' : item.quantity}</Text>
+                            <Text style={[styles.quantityDocBodyCell, styles.quantityDocUnitColumn]}>
+                              {isLengthUnit(item.unit) ? getLengthDisplayText(item) : getDisplayUnit(item.unit, item.quantity)}
+                            </Text>
+                          </View>
+                        );
+                      })}
+                    </View>
+                  </View>
+                </ViewShot>
+              </ScrollView>
+
+              <View style={styles.quantityPreviewActions}>
+                <TouchableOpacity
+                  style={styles.quantityPreviewCancelButton}
+                  onPress={() => setQuantityImagePreviewVisible(false)}
+                >
+                  <Text style={styles.quantityPreviewCancelText}>Close</Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.quantityPreviewShareButton, isGeneratingQuantityImage && styles.quantityPreviewButtonDisabled]}
+                  onPress={shareQuantitySheetImage}
+                  disabled={isGeneratingQuantityImage}
+                >
+                  <Text style={styles.quantityPreviewShareText}>
+                    {isGeneratingQuantityImage ? 'Generating...' : 'Share Image'}
+                  </Text>
+                </TouchableOpacity>
+                <TouchableOpacity
+                  style={[styles.quantityPreviewPdfButton, isGeneratingQuantityPdf && styles.quantityPreviewButtonDisabled]}
+                  onPress={shareMaterialRequirementsPdf}
+                  disabled={isGeneratingQuantityPdf}
+                >
+                  <Text style={styles.quantityPreviewShareText}>
+                    {isGeneratingQuantityPdf ? 'Generating...' : 'Share PDF'}
+                  </Text>
+                </TouchableOpacity>
+              </View>
+            </View>
+          </SafeAreaView>
+        </View>
+      </Modal>
 
       {/* One-Time Material Modal
           This modal creates a temporary row only for the current requisition.
@@ -606,6 +853,9 @@ export default function DraftScreen({ navigation, route, currentUser }) {
             </TouchableOpacity>
             <TouchableOpacity style={styles.menuOption} onPress={() => openMenuScreen('ImportantInfo')}>
               <Text style={styles.menuOptionText}>🖼️ Important Info</Text>
+            </TouchableOpacity>
+            <TouchableOpacity style={styles.menuOption} onPress={() => openMenuScreen('CableRequirements')}>
+              <Text style={styles.menuOptionText}>🧾 Cable & Wire Requirements</Text>
             </TouchableOpacity>
             <TouchableOpacity style={styles.menuOption} onPress={() => openMenuScreen('Profile')}>
               <Text style={styles.menuOptionText}>👤 User Profile</Text>
@@ -837,6 +1087,7 @@ const styles = StyleSheet.create({
   menuCloseButton: { backgroundColor: '#0a192f', padding: 13, borderRadius: 12, alignItems: 'center', marginTop: 4 },
   menuCloseText: { color: '#fff', fontWeight: '900' },
   btnSecondary: { backgroundColor: '#112240', padding: 15, borderRadius: 10, alignItems: 'center', marginTop: 12, borderWidth: 1, borderColor: '#64ffda' },
+  btnPdf: { backgroundColor: '#b45309', padding: 15, borderRadius: 8, alignItems: 'center', marginTop: 10 },
   btnShare: { backgroundColor: '#25D366', padding: 15, borderRadius: 10, alignItems: 'center', marginTop: 12 },
   btnDanger: { backgroundColor: '#ff4d4d15', padding: 14, borderRadius: 10, alignItems: 'center', marginTop: 12, borderWidth: 1, borderColor: '#ff4d4d' },
   btnText: { color: '#fff', fontWeight: 'bold', fontSize: 14, textTransform: 'uppercase', letterSpacing: 0.5 },
@@ -860,5 +1111,51 @@ const styles = StyleSheet.create({
   oneTimeUnitText: { fontSize: 11, color: '#333', fontWeight: 'bold' },
   oneTimeUnitTextActive: { color: '#fff' },
   modalActions: { flexDirection: 'row', justifyContent: 'space-between', marginTop: 15 },
-  modalButton: { padding: 12, borderRadius: 8, width: '48%', alignItems: 'center' }
+  modalButton: { padding: 12, borderRadius: 8, width: '48%', alignItems: 'center' },
+
+  // Material Requirements image preview and generated document.
+  quantityPreviewOverlay: { flex: 1, backgroundColor: 'rgba(2, 12, 27, 0.9)' },
+  quantityPreviewSafeArea: { flex: 1, paddingHorizontal: 10, paddingVertical: 8 },
+  quantityPreviewCard: { flex: 1, backgroundColor: '#dbe7ff', borderRadius: 18, overflow: 'hidden' },
+  quantityPreviewTopBar: { minHeight: 58, backgroundColor: '#112240', flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingHorizontal: 10 },
+  quantityPreviewTitle: { color: '#fff', fontSize: 18, fontWeight: '900', textAlign: 'center', flex: 1 },
+  quantityPreviewClose: { width: 42, height: 42, borderRadius: 21, backgroundColor: '#0a192f', alignItems: 'center', justifyContent: 'center' },
+  quantityPreviewCloseText: { color: '#fff', fontSize: 20, fontWeight: '900' },
+  quantityPreviewScroll: { flex: 1 },
+  quantityPreviewScrollContent: { padding: 10, alignItems: 'center' },
+  quantityCaptureWrapper: { width: '100%', maxWidth: 760 },
+  quantityDocument: { width: '100%', backgroundColor: '#f8fafc', borderRadius: 12, overflow: 'hidden', paddingBottom: 24 },
+  quantityDocumentHero: { minHeight: 112, backgroundColor: '#052a4a', paddingHorizontal: 20, paddingVertical: 16, flexDirection: 'row', alignItems: 'center' },
+  quantityDocumentHeroTextWrap: { flex: 1, paddingRight: 8, justifyContent: 'center' },
+  quantityDocumentHeroTitle: { color: '#fff', fontSize: 27, lineHeight: 31, fontWeight: '900', letterSpacing: 0.5 },
+  quantityDocumentUnderline: { width: 92, height: 4, backgroundColor: '#0ea5e9', marginTop: 9 },
+  quantityDocumentIconWrap: { width: 82, alignItems: 'center', justifyContent: 'center' },
+  quantityDocumentIcon: { fontSize: 40 },
+  quantityDocumentIconLabel: { color: '#38bdf8', fontSize: 10, fontWeight: '900' },
+  quantityDocumentMeta: { paddingHorizontal: 20, paddingVertical: 16 },
+  quantityDocumentMetaLabel: { color: '#092f55', fontWeight: '900', marginTop: 7, fontSize: 12 },
+  quantityDocumentMetaValue: { color: '#111827', minHeight: 27, borderBottomWidth: 1, borderBottomColor: '#94a3b8', paddingVertical: 4, marginBottom: 4, fontSize: 14 },
+  quantityDocumentTable: { marginHorizontal: 14, marginTop: 8, borderWidth: 1, borderColor: '#94a3b8', borderRadius: 8, overflow: 'hidden' },
+  quantityDocumentSectionTitle: { backgroundColor: '#052a4a', paddingVertical: 10, paddingHorizontal: 8 },
+  quantityDocumentSectionTitleText: { color: '#fff', fontSize: 18, fontWeight: '900', textAlign: 'center' },
+  quantityDocumentTableHeader: { flexDirection: 'row', backgroundColor: '#07345d' },
+  quantityDocumentTableRow: { flexDirection: 'row', minHeight: 52, backgroundColor: '#fff' },
+  quantityDocHeaderCell: { color: '#fff', fontWeight: '900', textAlign: 'center', paddingHorizontal: 5, paddingVertical: 10, borderRightWidth: 1, borderBottomWidth: 1, borderColor: '#94a3b8', fontSize: 10 },
+  quantityDocBodyCell: { color: '#111827', textAlign: 'center', paddingHorizontal: 5, paddingVertical: 11, borderRightWidth: 1, borderBottomWidth: 2, borderColor: '#94a3b8', fontSize: 12, textAlignVertical: 'center' },
+  quantityDocDescriptionBody: { paddingHorizontal: 8, paddingVertical: 8, borderRightWidth: 1, borderBottomWidth: 2, borderColor: '#94a3b8', justifyContent: 'center' },
+  quantityDocMaterialName: { color: '#111827', fontWeight: '800', fontSize: 12 },
+  quantityDocMaterialDetail: { color: '#475569', fontSize: 10, marginTop: 2 },
+  quantityDocNumberColumn: { width: '15%' },
+  quantityDocDescriptionColumn: { width: '49%' },
+  quantityDocQtyColumn: { width: '14%' },
+  quantityDocUnitColumn: { width: '22%' },
+  quantityDocItemNumber: { color: '#0b4a83', fontWeight: '900' },
+  quantityPreviewActions: { flexDirection: 'row', flexWrap: 'wrap', gap: 10, padding: 12, backgroundColor: '#ccd6f6', borderTopWidth: 1, borderTopColor: '#94a3b8' },
+  quantityPreviewCancelButton: { flex: 1, minHeight: 48, borderRadius: 10, borderWidth: 1, borderColor: '#475569', alignItems: 'center', justifyContent: 'center', backgroundColor: '#fff' },
+  quantityPreviewCancelText: { color: '#0a192f', fontWeight: '900' },
+  quantityPreviewShareButton: { flex: 1.3, minWidth: 110, minHeight: 48, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: '#12a86b' },
+  quantityPreviewPdfButton: { flex: 1.3, minWidth: 110, minHeight: 48, borderRadius: 10, alignItems: 'center', justifyContent: 'center', backgroundColor: '#b45309' },
+  quantityPreviewShareText: { color: '#fff', fontWeight: '900' },
+  quantityPreviewButtonDisabled: { opacity: 0.55 },
+
 });

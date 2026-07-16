@@ -2,7 +2,7 @@
  * CatalogScreen
  * -------------
  * Clean catalog view used only to search for materials and add them to the
- * Material Quantity Sheet. Editing controls are intentionally hidden here so
+ * Material Requirements. Editing controls are intentionally hidden here so
  * the user can focus on selecting materials without visual clutter.
  *
  * This version supports two ways to add materials:
@@ -509,7 +509,7 @@ const getSharedFamilyImageUri = (variants) => {
 
 // Shows the catalog-only description in a lightweight popup. The description
 // helps the user choose the correct family variant, but it is never copied into
-// the Material Quantity Sheet unless the user writes a custom note.
+// the Material Requirements unless the user writes a custom note.
 const showVariantDescription = (variant) => {
   const title = getMaterialDisplayName(variant);
   const description = String(variant?.description || '').trim();
@@ -1069,7 +1069,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
       : [selectedItem];
 
     // If the user selected several colors or several sizes from one family card,
-    // each selected option is sent as an individual row to the Material Quantity Sheet.
+    // each selected option is sent as an individual row to the Material Requirements.
     if (selectedFamilyItems.length > 1) {
       const newItems = selectedFamilyItems.map((item) => {
         const itemQty = isLengthUnit ? 1 : (parseInt(familyVariantQuantities[item.id], 10) || 1);
@@ -1546,7 +1546,7 @@ export default function CatalogScreen({ navigation, currentUser }) {
                   </View>
 
                   {!isAddingMultipleItems && selectedItem?.description ? (
-                    <Text style={styles.selectedDescription}>Description is shown above for selection only. It will not be added to the Material Quantity Sheet.</Text>
+                    <Text style={styles.selectedDescription}>Description is shown above for selection only. It will not be added to the Material Requirements.</Text>
                   ) : null}
                 </View>
 
