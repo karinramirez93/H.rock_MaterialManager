@@ -18,6 +18,38 @@ The project combines my experience in industrial electrical work with software d
 - Android Back button handling for navigation, modals, and editors.
 - User profile and role-aware application behavior.
 
+## Application Preview
+
+The screenshots below show the current Android application running on a physical device.
+
+### Material Requirements and Catalog
+
+<p align="center">
+  <img src="assets/Screenshot_20260929_161031_HrockerMaterialManager.jpg" alt="Material Requisition screen" width="30%" />
+  <img src="assets/Screenshot_20260929_161037_HrockerMaterialManager.jpg" alt="Searchable material catalog" width="30%" />
+  <img src="assets/Screenshot_20260929_161047_HrockerMaterialManager.jpg" alt="Add Material workflow" width="30%" />
+</p>
+
+The main workflow lets a user create a material requirement, search a reusable catalog, choose material variants, quantities, units, and optional job-site notes.
+
+### Generated Requirements and Field Reference
+
+<p align="center">
+  <img src="assets/Screenshot_20260929_161103_HrockerMaterialManager.jpg" alt="Material Requirements image preview" width="30%" />
+  <img src="assets/Screenshot_20260929_161146_HrockerMaterialManager.jpg" alt="Important Info reference screen" width="30%" />
+  <img src="assets/Screenshot_20260929_161150_HrockerMaterialManager.jpg" alt="Cable and Wire Requirements workflow" width="30%" />
+</p>
+
+Material requirements can be previewed and shared as an image or PDF. The application also provides an Important Info area for team reference photos and notes, plus a dedicated Cable & Wire Requirements workflow.
+
+### Cable Requirements Output
+
+<p align="center">
+  <img src="assets/Screenshot_20260929_161510_HrockerMaterialManager.jpg" alt="Generated Cable Requirements demo" width="32%" />
+</p>
+
+The Cable & Wire workflow can generate a structured requirement sheet containing the project name, requester, cable description, and required length.
+
 ## Technology Stack
 
 **Application**
